@@ -1,0 +1,15 @@
+# Local settings and Python/tool caches.
+/local.toml
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+/build/
+/dist/
+
+# Optional local data roots; large artifacts normally live outside the checkout.
+/runs/
+/artifacts/
+/cache/
