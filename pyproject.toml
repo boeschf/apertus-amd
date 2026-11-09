@@ -1,0 +1,19 @@
+[project]
+name = "apertus-amd"
+version = "0.1.0"
+description = "Pinned, reproducible dense Megatron experiments on Alps"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.scripts]
+apertus = "apertus_amd.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

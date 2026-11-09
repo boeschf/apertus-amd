@@ -13,3 +13,6 @@ __pycache__/
 /runs/
 /artifacts/
 /cache/
+
+# Local design notes, trial reports, and reference evidence.
+/docs/

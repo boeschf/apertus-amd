@@ -1,0 +1,29 @@
+data_root = "artifacts/experiment-data"
+scratch_root = "/dev/shm/apertus-amd"
+
+[slurm]
+account = "csstaff"
+partition = "mi300"
+nodes = 1
+gpus_per_node = 4
+cpus_per_node = 192
+memory_gb = 0 # Slurm: all allocatable memory.
+time = "01:00:00"
+# Beverin: four 24-core/48-thread NUMA domains, one per MI300A.
+cpu_bind = "map_ldom:0,1,2,3"
+distribution = "block:block"
+mpi = "pmix"
+network = "disable_rdzv_get"
+# Training uses the selected container, independently of the submitting shell's uenv.
+uenv_passthrough = "ignore"
+
+[environment]
+NCCL_P2P_DISABLE = "1"
+PMIX_MCA_psec = "native"
+
+[cache]
+max_gb = 16
+timeout = 300
+
+[image_stores]
+apertus-amd-images = "/capstor/store/cscs/cscs/public/team-ml/apertus-amd-images"

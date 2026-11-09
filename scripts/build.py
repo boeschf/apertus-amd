@@ -6,10 +6,13 @@
 """Build publishable image artifacts through alps-extended-images' manual helper."""
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -82,6 +85,45 @@ def snapshot(source: Path, archive: Path) -> dict:
     return {**metadata, "archive_sha256": checksum}
 
 
+def enroot_cleanup_workaround(env: dict, evidence: Path) -> dict:
+    """Patch only Enroot's known daemon-import cleanup trap in a private library copy."""
+    configured = env.get("ENROOT_LIBRARY_PATH")
+    if configured is None:
+        executable = shutil.which("enroot", path=env.get("PATH"))
+        try:
+            launcher = Path(executable).read_text() if executable else ""
+        except (OSError, UnicodeError):
+            launcher = ""
+        # Discover literal defaults from Enroot's launcher, including nonstandard
+        # installation prefixes. Never source/evaluate configuration in Python.
+        match = re.search(r'^config::export\s+ENROOT_LIBRARY_PATH\s+[\'\"]([^\'\"$`]+)[\'\"]\s*$', launcher, re.MULTILINE)
+        if match is None:
+            return {"applied": False, "reason": "helper location not discovered"}
+        configured = match[1]
+    library = Path(configured)
+    helper = library / "docker.sh"
+    if not helper.is_file():
+        return {"applied": False}
+    original = helper.read_text()
+    old = '''trap 'common::rmall "${tmpdir}" 2> /dev/null; docker rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT'''
+    new = '''trap 'status=$?; common::rmall "${tmpdir}" 2> /dev/null || true; "${engine}" rm -f -v "${tmpdir##*/}" > /dev/null 2>&1 || true; exit "${status}"' EXIT'''
+    record = {"applied": False, "original_sha256": hashlib.sha256(original.encode()).hexdigest()}
+    if original.count(old) == 1:
+        # Never modify the installed library or blanket-ignore an import failure.
+        # The trap selects Podman and preserves the pre-cleanup exit status.
+        private = evidence / "enroot-library"
+        shutil.copytree(library, private)
+        patched = original.replace(old, new, 1)
+        (private / "docker.sh").write_text(patched)
+        (evidence / "enroot-cleanup.patch").write_text("".join(difflib.unified_diff(
+            original.splitlines(True), patched.splitlines(True), fromfile="original/docker.sh", tofile="patched/docker.sh")))
+        env["ENROOT_LIBRARY_PATH"] = str(private)
+        record.update(applied=True, patched_sha256=hashlib.sha256(patched.encode()).hexdigest())
+        print(f"Enroot cleanup workaround: {private}", file=sys.stderr, flush=True)
+    write_json(evidence / "enroot-cleanup.json", {"library": str(library), **record})
+    return record
+
+
 def build(source: Path, output: Path, selector: list[str], *, processors: int = 4,
           isolation: str = "oci") -> dict:
     """Snapshot, build, and export into a new directory; retain evidence on failure.
@@ -117,10 +159,6 @@ def build(source: Path, output: Path, selector: list[str], *, processors: int = 
                CSCS_CI_ORIG_CLONE_URL=env.get("CSCS_CI_ORIG_CLONE_URL", metadata["repository"]),
                ENROOT_MAX_PROCESSORS=str(processors))
     env.setdefault("ENROOT_SQUASH_OPTIONS", "-comp zstd -Xcompression-level 3 -b 1048576 -mem 1024M")
-    # Keep Enroot extraction workspace beside the build's retained evidence.
-    temporary = output / "export-tmp"
-    temporary.mkdir()
-    env["ENROOT_TEMP_PATH"] = str(temporary)
     settings = {key: env[key] for key in (
         "CI_COMMIT_SHA", "CI_COMMIT_SHORT_SHA", "CSCS_CI_ORIG_CLONE_URL", "IMAGE_PREFIX",
         "ALPS_REV", "ENROOT_MAX_PROCESSORS", "ENROOT_SQUASH_OPTIONS", "ENROOT_LIBRARY_PATH",
@@ -182,11 +220,19 @@ bash "$1"
     if inspected["Id"].removeprefix("sha256:") != image_id.removeprefix("sha256:"):
         raise ValueError("inspected image differs from the build's iidfile")
     image = output / "image.sqsh"
+    # Extract locally, not beside potentially remote outputs: image trees contain
+    # many small files. Retain failed work and record its path for diagnosis.
+    temporary = Path(tempfile.mkdtemp(prefix="apertus-image-export-", dir=env.get("TMPDIR")))
+    env["ENROOT_TEMP_PATH"] = str(temporary)
+    write_json(evidence / "export-workspace.json", {"path": str(temporary)})
+    print(f"Export workspace: {temporary}", file=sys.stderr, flush=True)
+    cleanup_workaround = enroot_cleanup_workaround(env, evidence)
     run("export", ["enroot", "import", "-x", "tar", "-o", str(image), f"podman://{image_id}"])
     # -pf emits the entire filesystem data stream; discard data but retain errors.
     run("full-read", ["unsquashfs", "-no-progress", "-processors", str(processors),
                       "-data-queue", "32", "-frag-queue", "32", "-pf", "-", str(image)],
         stdout=subprocess.DEVNULL)
+    shutil.rmtree(temporary)
     record = {
         "source": metadata, "recipe": flags.f, "build_args": build_args,
         "canonical_ref": canonical, "id": canonical.rsplit("/", 1)[-1],
@@ -194,7 +240,7 @@ bash "$1"
         "image_manifest_digest": inspected.get("Digest"),
         "image_labels": inspected.get("Labels") or inspected.get("Config", {}).get("Labels"),
         "build_options": {"isolation": isolation},
-        "export_options": {"extract_mode": "tar"}, "settings": settings,
+        "export_options": {"extract_mode": "tar", "enroot_cleanup": cleanup_workaround}, "settings": settings,
         "validation": {"squashfs_full_read": "passed", "runtime": "not tested"},
     }
     # This record is the completion marker. Failures above leave diagnostic inputs

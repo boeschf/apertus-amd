@@ -1,0 +1,19 @@
+# Exact ROCm base CI commands from alps-extended-images, commit
+# 515652bae920b49243c8652c9a498a647a7ec628, ci-pipelines/child-templates.yaml.
+# Four ranks/GPUs per node from site configuration.
+nodes = 2
+[image]
+store = "apertus-amd-images"
+sha256 = "0662f3a37ef358cf09084c41af2780d4c3216ecf8b4c1df4f9d069747427c3f2"
+
+[environment]
+NCCL_DEBUG = "INFO"
+FI_LOG_LEVEL = "warn"
+
+[procedure]
+kind = "commands"
+timeout = 180
+commands = [
+  ["all_reduce_perf", "-b", "32", "-e", "4M", "-f", "2", "-g", "1"],
+  ["/usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall", "--type", "mpi_float", "--message-size", "32:2^22:2", "--full", "--tail-lat", "--accelerator", "rocm"],
+]

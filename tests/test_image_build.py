@@ -18,8 +18,63 @@ spec.loader.exec_module(builder_module)
 build = builder_module.build
 
 
+@pytest.mark.parametrize("export_status", [0, 23])
+@pytest.mark.parametrize("cleanup_status", [0, 17])
+def test_enroot_workaround_preserves_export_status(tmp_path, export_status, cleanup_status):
+    library = tmp_path / "custom installation"
+    library.mkdir()
+    original = '''trap 'common::rmall "${tmpdir}" 2> /dev/null; docker rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT\n'''
+    (library / "docker.sh").write_text(original)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    env = {"ENROOT_LIBRARY_PATH": str(library)}
+    record = builder_module.enroot_cleanup_workaround(env, evidence)
+    assert record["applied"] and record["original_sha256"] != record["patched_sha256"]
+    assert (library / "docker.sh").read_text() == original
+    # Exercise the trap in Bash: both cleanup operations may fail, and a real
+    # export failure must still propagate even when cleanup succeeds.
+    script = '''set -e
+tmpdir=/unused/workspace
+engine=podman
+common::rmall() { return "$CLEANUP_STATUS"; }
+podman() { printf '%s\\n' "$*" > "$CALLS"; return "$CLEANUP_STATUS"; }
+source "$HELPER"
+exit "$EXPORT_STATUS"
+'''
+    result = subprocess.run(["bash", "-c", script], env={**os.environ,
+        "HELPER": str(Path(env["ENROOT_LIBRARY_PATH"]) / "docker.sh"), "CALLS": str(tmp_path / "calls"),
+        "CLEANUP_STATUS": str(cleanup_status), "EXPORT_STATUS": str(export_status)}, capture_output=True)
+    assert result.returncode == export_status
+    assert (tmp_path / "calls").read_text().strip() == "rm -f -v workspace"
+
+
+def test_enroot_workaround_discovers_prefix_and_leaves_unknown_helpers(tmp_path):
+    library = tmp_path / "custom-prefix/lib/enroot"
+    library.mkdir(parents=True)
+    helper = library / "docker.sh"
+    helper.write_text("# Already fixed or a different Enroot implementation.\n")
+    executable = tmp_path / "enroot"
+    executable.write_text(f'#!/bin/bash\nconfig::export ENROOT_LIBRARY_PATH "{library}"\n')
+    executable.chmod(0o755)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    env = {"PATH": str(tmp_path)}
+    record = builder_module.enroot_cleanup_workaround(env, evidence)
+    assert record["applied"] is False and "original_sha256" in record
+    assert "ENROOT_LIBRARY_PATH" not in env
+    assert not (evidence / "enroot-library").exists()
+    assert helper.read_text() == "# Already fixed or a different Enroot implementation.\n"
+
+
 @pytest.fixture
 def builder(tmp_path, monkeypatch):
+    temporary = tmp_path / "node-local"
+    temporary.mkdir()
+    monkeypatch.setenv("TMPDIR", str(temporary))
+    library = tmp_path / "installed-enroot"
+    library.mkdir()
+    (library / "docker.sh").write_text('''trap 'common::rmall "${tmpdir}" 2> /dev/null; docker rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT\n''')
+    monkeypatch.setenv("ENROOT_LIBRARY_PATH", str(library))
     source = tmp_path / "checkout"
     source.mkdir()
     def git(*args):
@@ -79,6 +134,11 @@ elif stage == 'inspect':
     print(json.dumps([{'Id': 'a' * 64, 'Digest': 'sha256:' + 'b' * 64}]))
 elif stage == 'export':
     assert args[-1] == 'podman://sha256:' + 'a' * 64
+    workspace = pathlib.Path(os.environ['ENROOT_TEMP_PATH'])
+    assert workspace.parent == pathlib.Path(os.environ['TMPDIR'])
+    assert workspace.is_dir()
+    assert pathlib.Path(os.environ['ENROOT_LIBRARY_PATH']).name == 'enroot-library'
+    assert 'exit "${status}"' in pathlib.Path(os.environ['ENROOT_LIBRARY_PATH'], 'docker.sh').read_text()
     pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'hsqs fixture')
 else:
     assert pathlib.Path(args[-1]).read_bytes() == b'hsqs fixture'
@@ -115,10 +175,13 @@ def test_build_composes_with_unmodified_copied_publisher(builder, tmp_path):
     assert "build_script" not in record and "commands" not in record
     assert str(output) not in json.dumps(record)
     assert record["build_options"] == {"isolation": "oci"}
-    assert record["export_options"] == {"extract_mode": "tar"}
+    assert record["export_options"]["extract_mode"] == "tar"
+    assert record["export_options"]["enroot_cleanup"]["applied"] is True
     commands = json.loads((output / "evidence/commands.json").read_text())
     assert commands[2]["cwd"] == str(output / "context")
     assert (output / "evidence/build.sh").is_file()
+    workspace = Path(json.loads((output / "evidence/export-workspace.json").read_text())["path"])
+    assert not workspace.exists()
     with tarfile.open(result["source"]) as archive:
         assert not any(".git" in Path(entry.name).parts for entry in archive)
         assert archive.extractfile("Containerfile").read().endswith(b"# dirty input\n")
@@ -151,6 +214,9 @@ def test_failed_build_retains_evidence_without_publishable_provenance(builder, m
     steps = json.loads((output / "evidence/commands.json").read_text())
     assert steps[-1]["name"] == stage and steps[-1]["returncode"] == 23
     assert (output / f"evidence/{stage}.log").is_file()
+    if stage in {"export", "full-read"}:
+        workspace = Path(json.loads((output / "evidence/export-workspace.json").read_text())["path"])
+        assert workspace.is_dir() and workspace.parent == Path(os.environ["TMPDIR"])
 
 
 @pytest.fixture
@@ -193,7 +259,9 @@ def test_combined_build_failure_never_publishes(builder, combined_tools, tmp_pat
                             capture_output=True, text=True, cwd=tmp_path)
     assert result.returncode != 0 and not result.stdout
     assert not store.exists()
-    workspace, = temporary.iterdir()
+    workspace, = temporary.glob("image-build-publish-*")
+    export_workspace, = temporary.glob("apertus-image-export-*")
+    assert str(export_workspace) in result.stderr
     assert str(workspace) in result.stderr
     assert (workspace / "build/evidence/full-read.log").is_file()
     assert not (workspace / "build/provenance.json").exists()
