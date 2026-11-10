@@ -18,7 +18,10 @@ network = "disable_rdzv_get"
 uenv_passthrough = "ignore"
 
 [environment]
-NCCL_P2P_DISABLE = "1"
+# Avoid the Open MPI memory-patcher/HSA/MR-cache lock inversion during IPC setup.
+OMPI_MCA_memory = "^patcher"
+# Explicitly override images whose unset-only defaults disable RCCL P2P.
+NCCL_P2P_DISABLE = "0"
 PMIX_MCA_psec = "native"
 
 [cache]

@@ -38,6 +38,7 @@ Ranks retain visibility of the allocated GPUs and select their device using thei
 The CSCS site setting `uenv_passthrough = "ignore"` makes batch submission independent of a uenv loaded in the submitting shell.
 The generated container EDF sets `entrypoint = true` and launches a small Bash `exec` wrapper so the image's `BASH_ENV` initializes its runtime defaults, including Slingshot/libfabric settings.
 Use the site environment for intentional overrides.
+The supplied site enables RCCL P2P explicitly and excludes Open MPI's memory patcher (`OMPI_MCA_memory=^patcher`) to avoid an HSA/libfabric lock inversion during IPC setup.
 
 Images are published to a shared-filesystem registry accessible from the login and compute nodes.
 Each image is stored as an immutable, SHA-256-addressed object alongside its manifest and recipe source archive, so users can reuse the same published image across experiments.
@@ -79,6 +80,7 @@ uv run --locked apertus run experiments/dense-multinode-mc56351143a8e-ie84d7ba62
 ```
 
 If you have reservation access, add `--reservation NAME` when submitting.
+To queue a run after another job, use `--dependency afterany:JOB_ID`, or `afterok:JOB_ID` to require its success.
 Resource overrides include `--nodes`, `--gpus-per-node`, `--cpus-per-task`, `--memory-gb`, `--time`, `--cpu-bind`, and `--distribution`.
 Each included experiment records its intended allocation in top-level `nodes`; precedence is `--nodes`, then experiment `nodes`, then site `[slurm].nodes`.
 Rank placement is block across nodes; the site supplies within-node placement, CPU binding, MPI, and network options.

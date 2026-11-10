@@ -43,6 +43,7 @@ def main() -> None:
         parser.add_argument("--" + flag, type=int)
     parser.add_argument("--time")
     parser.add_argument("--reservation", help="optional Slurm reservation for a new allocation")
+    parser.add_argument("--dependency", help="batch dependency: afterany:JOB_ID or afterok:JOB_ID")
     parser.add_argument("--cpu-bind")
     parser.add_argument("--distribution", help="Slurm block:<within-node policy>; defaults to the site setting")
     parser.add_argument("--cache-mode", choices=("auto", "cold", "warm"), default="auto")

@@ -59,6 +59,47 @@ uv run --locked apertus run experiments/moe-mid4b-comm-warmup-m1072583a9632-ie84
   --site "$SITE" --submit --reservation cscs --checkout ../megatron/comm-warmup
 ```
 
+## Rebuilt Primus 26.8 Apertus image
+
+These experiments select the rebuilt `megatron-primus268-rocm` application image `cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0` from the shared `apertus-amd-images` store.
+They retain the corresponding workload and source settings above, with the dense checks on baseline Megatron and Mid-4B on the communicator-warmup backport.
+The image makes reference optimizations opt-in, so these experiments omit the old image's `B2_AUTOTUNE_SKIP=0` startup-hook workaround.
+The collective checks deliberately use the same Apertus application image as training.
+
+| Experiment | Nodes | Procedure |
+|---|---|---|
+| [dense-baseline-mc56351143a8e-icb5a384016a9](dense-baseline-mc56351143a8e-icb5a384016a9/experiment.toml) | 1 | Dense checkpoint/restart check |
+| [dense-multinode-mc56351143a8e-icb5a384016a9](dense-multinode-mc56351143a8e-icb5a384016a9/experiment.toml) | 2 | Distributed dense checkpoint/restart check |
+| [distributed-collectives-icb5a384016a9](distributed-collectives-icb5a384016a9/experiment.toml) | 2 | RCCL all-reduce and GPU-aware MPI all-to-all |
+| [moe-mid4b-comm-warmup-m1072583a9632-icb5a384016a9](moe-mid4b-comm-warmup-m1072583a9632-icb5a384016a9/experiment.toml) | 16 | Full-shape Mid-4B training with communicator warmup |
+
+```bash
+uv run --locked apertus run experiments/moe-mid4b-comm-warmup-m1072583a9632-icb5a384016a9 \
+  --site "$SITE" --submit --reservation cscs --checkout ../megatron/comm-warmup
+```
+
+Image build/publication checks establish artifact integrity; use these experiments to assess GPU execution, communication and workload-specific correctness.
+
+## Mid-4B allocator and compilation comparison
+
+These three 16-node variants retain the communicator-warmup source, rebuilt image, and 26-update workload.
+They make the two historical memory-related defaults explicit to separate allocator behavior from compilation.
+
+| Experiment | Expandable segments | Disable `torch.compile` |
+|---|---|---|
+| [moe-mid4b-mem-both-m1072583a9632-icb5a384016a9](moe-mid4b-mem-both-m1072583a9632-icb5a384016a9/experiment.toml) | True | 1 |
+| [moe-mid4b-mem-alloc-m1072583a9632-icb5a384016a9](moe-mid4b-mem-alloc-m1072583a9632-icb5a384016a9/experiment.toml) | True | 0 |
+| [moe-mid4b-mem-eager-m1072583a9632-icb5a384016a9](moe-mid4b-mem-eager-m1072583a9632-icb5a384016a9/experiment.toml) | False | 1 |
+
+Use `--cache-mode cold` for each comparison arm.
+The supplied site configuration enables RCCL P2P with `NCCL_P2P_DISABLE=0` and excludes Open MPI's memory patcher with `OMPI_MCA_memory=^patcher` to avoid its HSA/libfabric lock inversion during IPC setup.
+All three arms use these communication settings, which also differ from the earlier P2P-disabled historical runs.
+All select [validation/memory_trace.py](validation/memory_trace.py), which samples process memory, available cgroup counters, GPU allocator counters, and node/shared-memory usage every ten seconds, with private-cache sizes every minute.
+It preserves ordinary verified source execution and does not synchronize GPU work or reset memory peaks.
+The `memory-start-<rank>.json`, `memory-<rank>.jsonl`, and `memory-end-<rank>.json` artifacts retain effective settings and memory evidence, including partial traces after a killed process.
+Its final check verifies telemetry completeness and configured settings; it does not validate numerical equivalence or checkpoint contents.
+The prior uninstrumented new-image run is a historical comparison, not a simultaneously measured fourth arm.
+
 ## Outcomes and evidence
 
 Each invocation freezes its inputs and records its outcome under `<data-root>/runs/<experiment>/<run>/`.

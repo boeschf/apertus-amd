@@ -114,7 +114,7 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     resources = dict(settings["slurm"])
     if "nodes" in value:
         resources["nodes"] = value["nodes"]
-    for key in ("nodes", "gpus_per_node", "cpus_per_task", "memory_gb", "time", "cpu_bind", "distribution", "reservation"):
+    for key in ("nodes", "gpus_per_node", "cpus_per_task", "memory_gb", "time", "cpu_bind", "distribution", "reservation", "dependency"):
         if overrides.get(key) is not None:
             resources[key] = overrides[key]
     for key in ("nodes", "gpus_per_node", "cpus_per_node"):
@@ -132,6 +132,9 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     job_id = overrides.get("job_id")
     if bool(job_id) == bool(overrides.get("submit")):
         raise ValueError("select exactly one of job-id or submit")
+    if resources.get("dependency") and (not overrides.get("submit") or not re.fullmatch(
+            r"(?:afterany|afterok):[0-9]+(?::[0-9]+)*", resources["dependency"])):
+        raise ValueError("dependency requires batch submission and afterany:JOB_ID or afterok:JOB_ID")
     if job_id is not None and not re.fullmatch(r"[0-9]+", job_id):
         raise ValueError("job-id must be numeric")
     mode = overrides.get("cache_mode") or "auto"
