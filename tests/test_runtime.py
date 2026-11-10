@@ -106,9 +106,10 @@ def test_step_failure_retains_inputs_without_source_copies(prepared, tmp_path, m
 
 
 @pytest.mark.parametrize("reservation", [None, "cscs"])
-def test_batch_is_thin_and_submitted_once(prepared, tmp_path, monkeypatch, reservation):
+@pytest.mark.parametrize("dependency", [None, "afterany:98765"])
+def test_batch_is_thin_and_submitted_once(prepared, tmp_path, monkeypatch, reservation, dependency):
     prepared["launch"] = {"submit": True, "job_id": None}
-    prepared["resources"].update(nodes=2, reservation=reservation)
+    prepared["resources"].update(nodes=2, reservation=reservation, dependency=dependency)
     calls = []
     def submit(command, **kwargs):
         calls.append(command)
@@ -122,6 +123,7 @@ def test_batch_is_thin_and_submitted_once(prepared, tmp_path, monkeypatch, reser
     assert "#SBATCH --distribution=block:block" in script and "#SBATCH --ntasks-per-node=4" in script
     assert "#SBATCH --nodes=2" in script
     assert ("#SBATCH --reservation=cscs" in script) == bool(reservation)
+    assert ("#SBATCH --dependency=afterany:98765" in script) == bool(dependency)
     assert "#SBATCH --uenv-passthrough=ignore" in script
     assert "apertus_amd.runs" in script and "--num-layers" not in script
 

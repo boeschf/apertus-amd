@@ -37,6 +37,20 @@ def test_resource_overrides_and_procedure_preserve_explicit_arguments():
     assert len(config.phases(value, Path("/output"))) == 1
 
 
+@pytest.mark.parametrize("dependency", ["afterany:123", "afterok:123:456"])
+def test_dependency_is_retained_only_for_batch_submission(dependency):
+    value = config.resolve(EXPERIMENT, submit=True, dependency=dependency)
+    assert value['resources']['dependency'] == dependency
+    with pytest.raises(ValueError, match='dependency requires batch'):
+        config.resolve(EXPERIMENT, job_id='123', dependency=dependency)
+
+
+@pytest.mark.parametrize("dependency", ["afterany:", "123", "afterany:123\n#SBATCH --nodes=64"])
+def test_invalid_dependency_is_rejected(dependency):
+    with pytest.raises(ValueError, match='dependency requires batch'):
+        config.resolve(EXPERIMENT, submit=True, dependency=dependency)
+
+
 def test_node_count_precedence_in_plans(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("planning must be read-only"))
     experiment = tmp_path / "fixture"
