@@ -59,10 +59,10 @@ The following example starts with the small dense restart check.
 Inspect an invocation before submitting it; planning writes nothing and starts no jobs:
 
 ```bash
-uv run --locked apertus plan experiments/0001-dense-baseline \
+uv run --locked apertus plan experiments/dense-baseline-mc56351143a8e-ie84d7ba62309 \
   --site "$SITE" --submit --time 00:30:00
 
-uv run --locked apertus run experiments/0001-dense-baseline \
+uv run --locked apertus run experiments/dense-baseline-mc56351143a8e-ie84d7ba62309 \
   --site "$SITE" --submit --time 00:30:00 --checkout "$MEGATRON"
 ```
 
@@ -74,7 +74,7 @@ Both modes use the same frozen controller and direct-srun runtime.
 After the one-node check, submit the multi-node experiment:
 
 ```bash
-uv run --locked apertus run experiments/0002-dense-multinode \
+uv run --locked apertus run experiments/dense-multinode-mc56351143a8e-ie84d7ba62309 \
   --site "$SITE" --submit --time 00:30:00 --checkout "$MEGATRON"
 ```
 
@@ -91,7 +91,7 @@ Keep native batch sizes and parallelism arguments consistent with the selected G
 Before investigating a training communication failure, run the image CI's native RCCL all-reduce and GPU-aware MPI all-to-all checks on two nodes:
 
 ```bash
-uv run --locked apertus run experiments/0003-distributed-collectives \
+uv run --locked apertus run experiments/distributed-collectives-i0662f3a37ef3 \
   --site "$SITE" --submit --time 00:10:00
 ```
 
@@ -127,9 +127,9 @@ Compatibility includes image, source, GPU target, and configured environment/pre
 To compare cold and warm numerical results, run the same restart experiment twice, then pass the successful cold run directory to the warm invocation:
 
 ```bash
-uv run --locked apertus run experiments/0001-dense-baseline \
+uv run --locked apertus run experiments/dense-baseline-mc56351143a8e-ie84d7ba62309 \
   --site "$SITE" --job-id JOB_ID --checkout "$MEGATRON" --cache-mode cold
-uv run --locked apertus run experiments/0001-dense-baseline \
+uv run --locked apertus run experiments/dense-baseline-mc56351143a8e-ie84d7ba62309 \
   --site "$SITE" --job-id JOB_ID --checkout "$MEGATRON" --cache-mode warm \
   --compare-run /absolute/path/to/cold-run
 ```
@@ -142,6 +142,9 @@ A cold run does not replace existing shared cache objects.
 ## Create an experiment
 
 Copy an example directory and edit its `experiment.toml`.
+Name it `<workload>[-variant]-m<source>-i<image>`, using the first 12 hexadecimal characters of the Megatron commit and published image SHA-256.
+For image-native commands, omit `-m<source>`; choose a readable workload/variant label and keep the complete directory name within 64 lowercase letters, digits and hyphens.
+When changing either pin, rename the experiment directory to match; full hashes in `experiment.toml` remain authoritative.
 It owns the intended `nodes`, source commit, image selection, entry point, native Megatron `args`, environment, preparation commands, and procedure.
 For ordinary training, replace the entire `[procedure]` table with `kind = "train"`.
 This runs the selected entry point through the source-verification wrapper without smoke-test instrumentation or checkpoint comparisons.

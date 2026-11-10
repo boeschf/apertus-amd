@@ -67,7 +67,7 @@ def test_interruption_waits_for_child_before_returning(tmp_path, monkeypatch):
 
 @pytest.fixture
 def prepared(tmp_path, monkeypatch):
-    value = config.resolve(ROOT / "experiments/0001-dense-baseline", data_root=tmp_path / "data", job_id="123")
+    value = config.resolve(ROOT / "experiments/dense-baseline-mc56351143a8e-ie84d7ba62309", data_root=tmp_path / "data", job_id="123")
     source = tmp_path / "source"
     source.mkdir()
     (source / "source.tar").write_bytes(b"fixture")
@@ -88,7 +88,7 @@ def test_step_failure_retains_inputs_without_source_copies(prepared, tmp_path, m
     monkeypatch.setattr(subprocess, "run", failed)
     with pytest.raises(ValueError, match="step failed"):
         runs.run(prepared, tmp_path)
-    directory, = (Path(prepared["data_root"]) / "runs/0001-dense-baseline").iterdir()
+    directory, = (Path(prepared["data_root"]) / "runs" / prepared["experiment"]).iterdir()
     assert json.loads((directory / "result.json").read_text())["status"] == "failed"
     assert (directory / "tooling/apertus_amd/runtime.py").is_file()
     assert not list(directory.rglob("*.tar")) and not list(directory.rglob("*.bundle"))
@@ -135,7 +135,7 @@ def test_ambiguous_submission_is_retained_and_never_retried(prepared, tmp_path, 
     monkeypatch.setattr(subprocess, "run", interrupted)
     with pytest.raises(KeyboardInterrupt):
         runs.run(prepared, tmp_path)
-    directory, = (Path(prepared["data_root"]) / "runs/0001-dense-baseline").iterdir()
+    directory, = (Path(prepared["data_root"]) / "runs" / prepared["experiment"]).iterdir()
     assert len(calls) == 1
     assert json.loads((directory / "launch.json").read_text())["status"] == "submitting"
 
@@ -155,7 +155,7 @@ def test_submission_error_retains_scheduler_diagnostics_without_retry(prepared, 
     monkeypatch.setattr(subprocess, "run", rejected)
     with pytest.raises(subprocess.CalledProcessError):
         runs.run(prepared, tmp_path)
-    directory, = (Path(prepared["data_root"]) / "runs/0001-dense-baseline").iterdir()
+    directory, = (Path(prepared["data_root"]) / "runs" / prepared["experiment"]).iterdir()
     receipt = json.loads((directory / "submission.json").read_text())
     assert len(calls) == 1
     assert receipt["returncode"] == 1 and receipt["stderr"] == "site plugin rejected submission"
@@ -164,7 +164,7 @@ def test_submission_error_retains_scheduler_diagnostics_without_retry(prepared, 
 
 
 def test_native_commands_submission_needs_no_source_or_cache(tmp_path, monkeypatch):
-    value = config.resolve(ROOT / "experiments/0003-distributed-collectives", submit=True,
+    value = config.resolve(ROOT / "experiments/distributed-collectives-i0662f3a37ef3", submit=True,
                            nodes=2, data_root=tmp_path)
     monkeypatch.setattr(runs, "image_manifest", lambda *a, **k: {})
     monkeypatch.setattr(sources, "prepare", lambda *a, **k: pytest.fail("native image workload has no source"))
@@ -190,7 +190,7 @@ def test_native_command_retains_executable_identity_and_failure(tmp_path):
 
 
 def test_native_steps_continue_after_mpi_abort(tmp_path, monkeypatch):
-    value = config.resolve(ROOT / "experiments/0003-distributed-collectives", job_id="123")
+    value = config.resolve(ROOT / "experiments/distributed-collectives-i0662f3a37ef3", job_id="123")
     (tmp_path / "output").mkdir()
     calls = []
     def step(command, **kwargs):

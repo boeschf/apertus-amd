@@ -10,7 +10,7 @@ from apertus_amd.cli import plan
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPERIMENT = ROOT / "experiments/0001-dense-baseline"
+EXPERIMENT = ROOT / "experiments/dense-baseline-mc56351143a8e-ie84d7ba62309"
 
 
 def test_plan_uses_full_node_defaults_without_subprocesses(monkeypatch):
@@ -41,7 +41,7 @@ def test_node_count_precedence_in_plans(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("planning must be read-only"))
     experiment = tmp_path / "fixture"
     experiment.mkdir()
-    text = (ROOT / "experiments/0003-distributed-collectives/experiment.toml").read_text()
+    text = (ROOT / "experiments/distributed-collectives-i0662f3a37ef3/experiment.toml").read_text()
     path = experiment / "experiment.toml"
     path.write_text(text)
     for launch in ({"submit": True}, {"job_id": "123"}):
@@ -57,7 +57,7 @@ def test_node_count_precedence_in_plans(tmp_path, monkeypatch):
 
 def test_native_plan_is_read_only_and_rejects_training_options(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("planning must be read-only"))
-    experiment = ROOT / "experiments/0003-distributed-collectives"
+    experiment = ROOT / "experiments/distributed-collectives-i0662f3a37ef3"
     value = plan(experiment, submit=True, nodes=2)
     assert len(value["phases"]) == 2
     assert value["phases"][0]["argv"][0] == "all_reduce_perf"
