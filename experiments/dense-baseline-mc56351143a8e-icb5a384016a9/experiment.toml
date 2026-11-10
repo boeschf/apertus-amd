@@ -1,0 +1,36 @@
+nodes = 1
+entrypoint = "pretrain_gpt.py"
+prepare = [["make", "-C", "megatron/core/datasets"]]
+args = [
+  "--num-layers", "4", "--hidden-size", "256", "--num-attention-heads", "4",
+  "--seq-length", "128", "--max-position-embeddings", "128", "--vocab-size", "1024",
+  "--micro-batch-size", "1", "--global-batch-size", "4", "--train-iters", "4", "--seed", "1234",
+  "--tensor-model-parallel-size", "1", "--pipeline-model-parallel-size", "1",
+  "--transformer-impl", "local", "--optimizer", "adam", "--bf16",
+  "--lr", "0.0001", "--min-lr", "0.0001", "--lr-decay-style", "constant", "--weight-decay", "0.01",
+  "--attention-dropout", "0", "--hidden-dropout", "0", "--tokenizer-type", "NullTokenizer",
+  "--num-workers", "0", "--eval-iters", "0", "--eval-interval", "4", "--log-interval", "1",
+  "--save-interval", "2", "--ckpt-format", "torch", "--mock-data",
+  "--no-gradient-accumulation-fusion", "--no-masked-softmax-fusion",
+  "--no-bias-gelu-fusion", "--no-bias-dropout-fusion",
+]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git" # Provenance, not an origin/transport constraint.
+commit = "c56351143a8e15899ef3d7d7f97867772f8e0e5c"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+NVTE_FLASH_ATTN = "1"
+NVTE_FUSED_ATTN = "1"
+NVTE_UNFUSED_ATTN = "1"
+
+[procedure]
+kind = "restart"
+validation = "../validation/dense_restart.py"
+split = 2
+attention = "megatron.core.transformer.dot_product_attention.DotProductAttention"

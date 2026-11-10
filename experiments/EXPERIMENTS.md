@@ -85,20 +85,25 @@ Image build/publication checks establish artifact integrity; use these experimen
 These three 16-node variants retain the communicator-warmup source, rebuilt image, and 26-update workload.
 They make the two historical memory-related defaults explicit to separate allocator behavior from compilation.
 
-| Experiment | Expandable segments | Disable `torch.compile` |
-|---|---|---|
-| [moe-mid4b-mem-both-m1072583a9632-icb5a384016a9](moe-mid4b-mem-both-m1072583a9632-icb5a384016a9/experiment.toml) | True | 1 |
-| [moe-mid4b-mem-alloc-m1072583a9632-icb5a384016a9](moe-mid4b-mem-alloc-m1072583a9632-icb5a384016a9/experiment.toml) | True | 0 |
-| [moe-mid4b-mem-eager-m1072583a9632-icb5a384016a9](moe-mid4b-mem-eager-m1072583a9632-icb5a384016a9/experiment.toml) | False | 1 |
+| Experiment | Expandable segments | Disable `torch.compile` | Disable P2P |
+|---|---|---|---|
+| [moe-mid4b-mem-both-m1072583a9632-icb5a384016a9](moe-mid4b-mem-both-m1072583a9632-icb5a384016a9/experiment.toml) | True | 1 | 0 (site default) |
+| [moe-mid4b-mem-alloc-m1072583a9632-icb5a384016a9](moe-mid4b-mem-alloc-m1072583a9632-icb5a384016a9/experiment.toml) | True | 0 | 1 |
+| [moe-mid4b-mem-eager-m1072583a9632-icb5a384016a9](moe-mid4b-mem-eager-m1072583a9632-icb5a384016a9/experiment.toml) | False | 1 | 1 |
 
 Use `--cache-mode cold` for each comparison arm.
 The supplied site configuration enables RCCL P2P with `NCCL_P2P_DISABLE=0` and excludes Open MPI's memory patcher with `OMPI_MCA_memory=^patcher` to avoid its HSA/libfabric lock inversion during IPC setup.
-All three arms use these communication settings, which also differ from the earlier P2P-disabled historical runs.
+The allocator-only and compile-disable-only arms explicitly disable P2P and should be compared with the combined-settings P2P-disabled control below.
+All retain the Open MPI patcher exclusion.
 All select [validation/memory_trace.py](validation/memory_trace.py), which samples process memory, available cgroup counters, GPU allocator counters, and node/shared-memory usage every ten seconds, with private-cache sizes every minute.
 It preserves ordinary verified source execution and does not synchronize GPU work or reset memory peaks.
 The `memory-start-<rank>.json`, `memory-<rank>.jsonl`, and `memory-end-<rank>.json` artifacts retain effective settings and memory evidence, including partial traces after a killed process.
 Its final check verifies telemetry completeness and configured settings; it does not validate numerical equivalence or checkpoint contents.
 The prior uninstrumented new-image run is a historical comparison, not a simultaneously measured fourth arm.
+
+[moe-mid4b-mem-nop2p-m1072583a9632-icb5a384016a9](moe-mid4b-mem-nop2p-m1072583a9632-icb5a384016a9/experiment.toml) is the P2P-disabled control for the combined-settings arm.
+It overrides the site's P2P setting with `NCCL_P2P_DISABLE=1`, retaining expandable segments, disabled `torch.compile`, the Open MPI patcher exclusion, and identical memory instrumentation.
+Run it with `--cache-mode cold` to match the combined-settings comparison.
 
 ## Outcomes and evidence
 
