@@ -162,7 +162,7 @@ def verify(bundle: Path, record: dict, *, max_bytes: int) -> None:
     archive = bundle / "payload.tar"
     if record["schema"] != SCHEMA or sha256(archive) != record["sha256"]:
         raise ValueError("compiler cache checksum/schema mismatch")
-    actual, groups, total = {}, {}, 0
+    actual, groups, children, total = {}, {}, {}, 0
     with tarfile.open(archive, "r:") as stream:
         for entry in stream:
             object_key(entry.name)
@@ -181,12 +181,15 @@ def verify(bundle: Path, record: dict, *, max_bytes: int) -> None:
                 else:
                     checksum = hashlib.file_digest(source, "sha256").hexdigest()
             actual[entry.name] = {"size": entry.size, "sha256": checksum}
+            path = PurePosixPath(entry.name)
+            children.setdefault(path.parent, set()).add(path.name)
     if objects(actual) != objects(record["files"]):
         raise ValueError("cache file manifest mismatch")
     for name, data in groups.items():
         parent = PurePosixPath(name).parent
-        names = {PurePosixPath(n).name for n in actual if PurePosixPath(n).parent == parent}
-        group_bytes(data, names)
+        # Index once: scanning every member for every group is quadratic across
+        # thousands of kernels, repeated for every rank during publication.
+        group_bytes(data, children[parent])
 
 
 def _generation(namespace: Path, generation: str, descriptor: dict, max_bytes: int) -> tuple[Path, dict]:

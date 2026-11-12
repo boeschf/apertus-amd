@@ -105,6 +105,58 @@ The prior uninstrumented new-image run is a historical comparison, not a simulta
 It overrides the site's P2P setting with `NCCL_P2P_DISABLE=1`, retaining expandable segments, disabled `torch.compile`, the Open MPI patcher exclusion, and identical memory instrumentation.
 Run it with `--cache-mode cold` to match the combined-settings comparison.
 
+## Compilation and performance work
+
+[moe-mid4b-compile-m1072583a9632-icb5a384016a9](moe-mid4b-compile-m1072583a9632-icb5a384016a9/experiment.toml) retains the allocator-only workload with expandable segments, compilation enabled, and P2P disabled.
+It adds `TORCH_LOGS=recompiles,graph_breaks` and opt-in per-rank compiler telemetry through `APERTUS_COMPILE_TRACE=1`.
+The memory validator records Dynamo counters and Inductor's generated-kernel count before training, after each native `train_step`, and on exit in `compilation-<rank>.jsonl`.
+It neither resets compiler counters nor synchronizes GPU work.
+These version-specific counters establish compilation activity and when it changes; they do not establish numerical equivalence.
+Run identical inputs with `--cache-mode cold`, then `--cache-mode warm` after successful publication.
+Warm mode restores portable Triton objects, AITER modules, and dataset helpers; it does not restore Inductor graph caches or autotuning state.
+Compare early-step compilation and late-step throughput separately.
+
+The [performance plan](PERFORMANCE.md) covers the Mid-4B reference comparison and the separate Chonk baseline.
+
+[moe-mid4b-profile-m1072583a9632-icb5a384016a9](moe-mid4b-profile-m1072583a9632-icb5a384016a9/experiment.toml) adds only native PyTorch-profiler arguments to the compilation diagnostic.
+It profiles one update after step 10 on ranks 0/1 and 32/33, covering both pipeline stages and local-rank-0 versus local-rank-1 behavior.
+Traces are retained under `output/torch_profile/`; use unprofiled runs for throughput comparisons.
+
+## KDA Chonk baseline: primary target
+
+[moe-chonk-kda-m1072583a9632-icb5a384016a9](moe-chonk-kda-m1072583a9632-icb5a384016a9/experiment.toml) uses the full trained model geometry: 42 layers with three leading dense layers, hidden size 3584, dense FFN 17280, and 256 routed experts/top-8 with expert/shared FFN 1920 and latent size 1792.
+It uses 31 KDA / 11 global layers, 28/7 global-attention heads, head dimension 128, sequence length 4096, NoPE, and the production PP4/VPP2 layout.
+The benchmark selects 16 nodes / 64 GPUs, EP16, microbatch 1, and global batch 512: DP16 with 32 microbatches per update.
+The current production size and `md_decoupling` recipe supply learning rates, polar-express Muon, row hyperspheres, fan-in radii, and softplus gains.
+The 409,600-sample warmup and 244,137,984-sample decay horizons become 800 and 476,832 updates at this benchmark batch.
+It uses mock data from random initialization, native BF16 expert GEMMs/all-to-all, no CPU offload, no gradient-reduction overlap or gradient-accumulation fusion, and selective `layernorm linear_attn moe` recomputation.
+Goldfish loss is disabled for this mock-data baseline because it requires special-token metadata from a real HuggingFace tokenizer.
+Compilation, expandable segments, communicator warmup, and memory/compiler telemetry follow the measured Mid-4B baseline; P2P and pipeline-communication overlap are disabled explicitly.
+Histogram quantile balancing and per-channel KDA `A_log` are explicit current-stack choices.
+The latter matches the current production KDA launcher but differs from the older checkpoint inspection, which reports per-head `A_log`.
+This is a full-model throughput/memory baseline with explicit benchmark deviations, not a production-checkpoint or numerical-reproduction test.
+The unprofiled baseline runs 60 updates with a final checkpoint, retaining updates 11–26 and preselecting updates 45–60 to assess late timing drift.
+Use two warm-cache repetitions for this extended comparison; the initial 26-update invocation retains its frozen inputs in its run directory.
+
+[moe-chonk-kda-profile-m1072583a9632-icb5a384016a9](moe-chonk-kda-profile-m1072583a9632-icb5a384016a9/experiment.toml) retains the initial 26-update duration and adds native PyTorch-profiler arguments.
+It profiles one update after step 10 on ranks 0/1, 16/17, 32/33, and 48/49, covering all four pipeline stages and neighboring local ranks.
+Use its traces to identify actual Chonk kernel paths and shapes; use the unprofiled baseline for throughput.
+
+## Historical SWA Chonk baseline
+
+[moe-chonk-swa-m1072583a9632-icb5a384016a9](moe-chonk-swa-m1072583a9632-icb5a384016a9/experiment.toml) brings the historical SWA workload logged by reference job 677561 onto our pinned communicator-warmup source and Primus 26.8 image.
+This is distinct from the primary KDA Chonk target.
+It has 42 layers, hidden size 3584, 256 experts/top-8, sequence length 8192, and sliding/global fused attention.
+The explicit layout selects PP4/VPP2 with EP16 on 16 nodes / 64 GPUs, using global batch 256 and microbatch 1.
+Its optimizer uses quintic Muon with five Newton–Schulz steps, direct gains, flat hyperspheres, and constant learning rates.
+The old `--hypersphere-radius-from-init` spelling maps to `--hypersphere-radius-mode init`, whose radius multiplier remains `sqrt(min(d_out,d_in)/hidden_size)`.
+Quantile balancing explicitly selects `legacy_average` to retain the older raw-logit estimator rather than today's histogram default.
+The historical expert-bias flag and update rate are omitted: the old quantile-routing path did not consume that separate bias, and the new source rejects combining them.
+It retains reference gradient-reduction overlap, default gradient-accumulation fusion, disabled pipeline communication overlap, and compilation disabled.
+The baseline uses our explicit P2P-disabled transport setting, expandable segments, communicator warmup, private caches, and memory telemetry.
+It adds a final checkpoint and zero data-loader workers to the reference's 26-update mock-data workload.
+This establishes a baseline on our stack; historical source/image identity and numerical equivalence to the reference remain unresolved.
+
 ## Outcomes and evidence
 
 Each invocation freezes its inputs and records its outcome under `<data-root>/runs/<experiment>/<run>/`.

@@ -102,3 +102,30 @@ def test_check_rejects_missing_rank_and_conflicting_override(trace, tmp_path):
     (output / 'memory-start-1.json').write_text(json.dumps({'environment': env, 'hostname': 'node'}))
     with pytest.raises(ValueError, match='confounding'):
         trace.check(tmp_path)
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_compilation_observer_preserves_results_and_restores_on_failure(trace, monkeypatch, tmp_path, fails):
+    counters = {'generated_kernel_count': 0, 'counters': {}}
+    monkeypatch.setattr(trace, 'compilation_snapshot', lambda: counters)
+
+    def original(value, *, fail=False):
+        if fail:
+            raise RuntimeError('step failed')
+        counters['generated_kernel_count'] += 2
+        return value
+
+    module = SimpleNamespace(train_step=original)
+    value = object()
+    try:
+        with trace.trace_compilation_steps(module, tmp_path, 0):
+            assert module.train_step(value) is value
+            if fails:
+                module.train_step(value, fail=True)
+    except RuntimeError as error:
+        assert fails and str(error) == 'step failed'
+    assert module.train_step is original
+    rows = [json.loads(line) for line in (tmp_path / 'compilation-0.jsonl').read_text().splitlines()]
+    assert [r['status'] for r in rows] == ['start', 'step', 'end']
+    assert [r['generated_kernel_count'] for r in rows] == [0, 2, 2]
+    assert [r['completed_train_steps'] for r in rows] == [0, 1, 1]

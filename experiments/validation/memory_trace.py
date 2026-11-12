@@ -1,6 +1,9 @@
-"""Sample Mid-4B memory without changing training kernels or synchronizing GPUs."""
+"""Sample training memory without changing kernels or synchronizing GPUs."""
 
 import json
+from contextlib import contextmanager, ExitStack
+from functools import wraps
+import importlib
 import os
 from pathlib import Path
 import socket
@@ -10,6 +13,44 @@ import time
 
 from apertus_amd.artifacts import write_json
 from apertus_amd.entrypoint import train
+from apertus_amd.config import option
+
+
+def compilation_snapshot() -> dict:
+    """Read version-specific compiler counters without resetting them or synchronizing GPUs."""
+    from torch._dynamo.utils import counters
+    from torch._inductor import metrics
+
+    return {'counters': {str(group): {str(key): value for key, value in items.items()}
+                         for group, items in counters.items()},
+            'generated_kernel_count': metrics.generated_kernel_count}
+
+
+@contextmanager
+def trace_compilation_steps(module, output: Path, rank: int):
+    """Observe completed native train_step calls and restore the entry point on every exit."""
+    original = module.train_step
+    completed = 0
+    with (output / f'compilation-{rank}.jsonl').open('w', buffering=1) as stream:
+        def record(status):
+            stream.write(json.dumps({'time': time.time(), 'completed_train_steps': completed,
+                                     'status': status, **compilation_snapshot()}) + '\n')
+
+        @wraps(original)
+        def step(*args, **kwargs):
+            nonlocal completed
+            result = original(*args, **kwargs)
+            completed += 1
+            record('step')
+            return result
+
+        record('start')
+        module.train_step = step
+        try:
+            yield
+        finally:
+            module.train_step = original
+            record('end')
 
 
 def read_text(path: Path) -> str:
@@ -88,7 +129,8 @@ def trace_training(output: Path, source: Path, entrypoint: str, args: list[str])
     groups = cgroup_paths()
     variables = ('PYTORCH_HIP_ALLOC_CONF', 'PYTORCH_CUDA_ALLOC_CONF', 'PYTORCH_ALLOC_CONF',
                  'TORCH_COMPILE_DISABLE', 'TORCHDYNAMO_DISABLE', 'MAX_JOBS', 'OMP_NUM_THREADS',
-                 'TMPDIR', 'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR')
+                  'TMPDIR', 'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR',
+                  'APERTUS_COMPILE_TRACE', 'TORCH_LOGS')
     write_json(output / f'memory-start-{rank}.json', {
         'rank': rank, 'device': device, 'hostname': socket.gethostname(), 'pid': os.getpid(),
         'environment': {key: os.environ.get(key) for key in variables},
@@ -118,7 +160,16 @@ def trace_training(output: Path, source: Path, entrypoint: str, args: list[str])
     worker.start()
     completed = False
     try:
-        train(output, source, entrypoint, args)
+        with ExitStack() as observers:
+            if os.environ.get('APERTUS_COMPILE_TRACE') == '1':
+                def setup():
+                    # train() installs the frozen source path before this import and
+                    # verifies its identity; no training kernels or counters are replaced.
+                    module = importlib.import_module('megatron.training.training')
+                    observers.enter_context(trace_compilation_steps(module, output, rank))
+                train(output, source, entrypoint, args, before_run=setup)
+            else:
+                train(output, source, entrypoint, args)
         completed = True
     finally:
         stop.set()
@@ -156,6 +207,12 @@ def check(run: Path) -> None:
         if start['environment']['PYTORCH_CUDA_ALLOC_CONF'] is not None or \
                 start['environment']['TORCHDYNAMO_DISABLE'] not in (None, '0'):
             raise ValueError(f'confounding allocator/compiler override on rank {rank}')
+        if settings['environment'].get('APERTUS_COMPILE_TRACE') == '1':
+            rows = [json.loads(line) for line in (output / f'compilation-{rank}.jsonl').read_text().splitlines()]
+            steps = int(option(settings['args'], '--train-iters'))
+            if [r['status'] for r in rows] != ['start', *(['step'] * steps), 'end'] or \
+                    [r['completed_train_steps'] for r in rows] != [0, *range(1, steps + 1), steps]:
+                raise ValueError(f'incomplete compilation telemetry for rank {rank}')
         records.append({'rank': rank, 'samples': samples, 'hostname': start['hostname']})
     write_json(run / 'output/checks.json', {
         'status': 'passed', 'scope': 'memory telemetry completeness and explicit settings',

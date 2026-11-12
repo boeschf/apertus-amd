@@ -1,6 +1,7 @@
 """Generation reconciliation, private rank hydration, relocation, and failure gates."""
 
 import fcntl
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -198,3 +199,23 @@ def test_corrupt_differing_contribution_is_rejected_even_when_key_already_exists
     with pytest.raises(ValueError, match="checksum"):
         publish(root, [incoming])
     assert cache.stage(root, {}, tmp_path / "staged", max_bytes=LIMIT)["generation"] == first["generation"]
+
+
+def test_group_cannot_reference_a_file_in_another_object(tmp_path):
+    first, second = "triton/" + "A" * 32, "triton/" + "B" * 32
+    members = {
+        first + "/kernel.hsaco": b"first",
+        first + "/__grp__kernel.json": cache.canonical({"child_paths": {"other.hsaco": "other.hsaco"}}),
+        second + "/other.hsaco": b"second",
+        second + "/__grp__kernel.json": cache.canonical({"child_paths": {"other.hsaco": "other.hsaco"}}),
+    }
+    archive = tmp_path / "payload.tar"
+    with tarfile.open(archive, "w") as output:
+        for name, data in members.items():
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            output.addfile(entry, io.BytesIO(data))
+    record = {"schema": cache.SCHEMA, "sha256": sha256(archive), "files": {
+        name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in members.items()}}
+    with pytest.raises(ValueError, match="absent artifact"):
+        cache.verify(tmp_path, record, max_bytes=LIMIT)

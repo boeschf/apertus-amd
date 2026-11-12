@@ -1,0 +1,80 @@
+# Full KDA Chonk geometry; bounded mock-data benchmark on 16 MI300A nodes.
+# Current production size/optimizer recipe, with explicit native baseline deviations.
+# Extended to 60 updates after the initial 26-update run showed late timing drift.
+nodes = 16
+entrypoint = "pretrain_gpt.py"
+prepare = [["make", "-C", "megatron/core/datasets"]]
+args = [
+  "--num-layers", "42", "--hidden-size", "3584", "--ffn-hidden-size", "17280",
+  "--num-attention-heads", "28", "--group-query-attention", "--num-query-groups", "7",
+  "--kv-channels", "128", "--normalization", "RMSNorm", "--qk-layernorm", "--sandwich-norm",
+  "--residual-output-scaling", "--scale-embeddings-by-sqrt-hidden",
+  "--untie-embeddings-and-output-weights", "--disable-bias-linear", "--sssglu",
+  "--position-embedding-type", "rope", "--rotary-base", "10000", "--no-rope-freq", "1",
+  "--seq-length", "4096", "--max-position-embeddings", "4096",
+  "--vocab-size", "200063", "--make-vocab-size-divisible-by", "128",
+  "--attention-dropout", "0", "--hidden-dropout", "0", "--init-method-std", "0.016703827619526525",
+  "--enable-experimental", "--experimental-attention-variant", "kda",
+  "--linear-attention-freq", "([1,1,1,0]*10+[1,0])",
+  "--linear-attention-safe-output-gate", "--attention-output-gate",
+  "--linear-conv-kernel-dim", "4", "--linear-key-head-dim", "128",
+  "--linear-value-head-dim", "128", "--linear-num-key-heads", "28", "--linear-num-value-heads", "28",
+  "--transformer-impl", "transformer_engine", "--attention-backend", "auto",
+  "--num-experts", "256", "--moe-router-topk", "8", "--moe-layer-freq", "([0]*3+[1]*39)",
+  "--moe-ffn-hidden-size", "1920", "--moe-latent-size", "1792",
+  "--moe-shared-expert-intermediate-size", "1920", "--moe-grouped-gemm", "--moe-permute-fusion",
+  "--moe-token-dispatcher-type", "alltoall", "--moe-router-score-function", "sigmoid",
+  "--moe-router-dtype", "fp32", "--moe-router-topk-scaling-factor", "2.5",
+  "--moe-router-load-balancing-type", "quantile_balancing", "--moe-aux-loss-coeff", "0.0",
+  "--moe-router-quantile-balancing-method", "histogram", "--moe-router-quantile-balancing-ema", "0",
+  "--tensor-model-parallel-size", "1", "--pipeline-model-parallel-size", "4",
+  "--pipeline-model-parallel-layout", "Ettt|(tttttt|)*2,(ttttt|)*2,(tttttt|)*2,tttttL",
+  "--context-parallel-size", "1", "--expert-model-parallel-size", "16", "--expert-tensor-parallel-size", "1",
+  "--micro-batch-size", "1", "--global-batch-size", "512", "--bf16", "--main-grads-dtype", "fp32",
+  "--optimizer", "md_decoupling", "--use-layer-wise-distributed-optimizer", "--weight-decay", "0",
+  "--use-orthogonal-updates", "--muon-coefficient-type", "polar_express", "--muon-scale-mode", "shape_up",
+  "--muon-router-scale-mode", "none", "--muon-momentum", "0.95", "--muon-use-nesterov",
+  "--hypersphere-mode", "row", "--hypersphere-embedding-mode", "row", "--hypersphere-router-mode", "row",
+  "--hypersphere-radius-mode", "fan_in", "--md-router-use-orthogonal-updates", "True",
+  "--hypersphere-gains-mode", "rowcol", "--hypersphere-gains-mode-router", "rowcol",
+  "--hypersphere-gains-mode-embedding", "none", "--gain-parametrization", "softplus",
+  "--lr", "0.00616", "--min-lr", "0.0001", "--matrix-lr", "0.0308", "--gains-lr", "0.00616",
+  "--lr-decay-style", "linear", "--lr-warmup-iters", "800", "--lr-decay-iters", "476832",
+  "--min-lr-mode", "absolute", "--adam-beta1", "0.9", "--adam-beta2", "0.95", "--clip-grad", "1",
+  "--recompute-granularity", "selective", "--recompute-modules", "layernorm", "linear_attn", "moe",
+  "--no-gradient-accumulation-fusion", "--no-overlap-p2p-communication",
+  "--train-iters", "60", "--seed", "42", "--save-interval", "60", "--ckpt-format", "torch",
+  "--mock-data", "--tokenizer-type", "NullTokenizer", "--split", "100,0,0", "--num-workers", "0",
+  "--no-create-attention-mask-in-dataloader", "--eval-iters", "0", "--eval-interval", "100000",
+  "--log-interval", "1", "--log-throughput", "--distributed-timeout-minutes", "20",
+  "--manual-gc", "--manual-gc-interval", "100",
+]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "1072583a9632fd1902544f7eaea562e2578ef1de"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+NCCL_DEBUG = "INFO"
+NCCL_P2P_DISABLE = "1"
+NVTE_FLASH_ATTN = "1"
+NVTE_FUSED_ATTN = "1"
+NVTE_UNFUSED_ATTN = "1"
+KDA_ALOG_PER_CHANNEL = "1"
+BEVERIN_COMM_WARMUP = "1"
+BEVERIN_COMM_WARMUP_PARTS = "ar,p2p,a2a"
+NCCL_RUNTIME_CONNECT = "0"
+SS_BALLAST_GB = "0"
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+TORCH_COMPILE_DISABLE = "0"
+APERTUS_COMPILE_TRACE = "1"
+TORCH_LOGS = "recompiles,graph_breaks"
+
+[procedure]
+kind = "train"
+validation = "../validation/memory_trace.py"
