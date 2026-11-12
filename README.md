@@ -220,6 +220,11 @@ printf '%s\n' "$PUBLISHED_IMAGE"
 ```
 
 The publisher prints `<store>/objects/sha256/<sha256>/image.sqsh` and stores immutable checksum-addressed artifacts.
+The registry supports multiple publishers in its owning group (`csstaff` for the shared store).
+The publisher ensures group write access and public read/traverse access on the store, `objects/`, and `objects/sha256/`, even under a restrictive umask.
+Shared directories use setgid to retain group ownership and sticky bits to protect other publishers' entries; newly created public directories use `03775`, and `.staging` and `.locks` use `03770`.
+Individual staging directories remain publisher-private until publication; published object directories use `0755` and artifact files use `0644`.
+The store's parent directories must also permit colleagues to traverse them.
 Set an entry in your site's `[image_stores]` table to `$IMAGE_STORE`, then set the experiment's `[image].store` to that entry's name and `[image].sha256` to the printed image's parent directory name.
 To publish the base for collective tests, pass its three output files to the same publisher and select its checksum in the collective experiment.
 Publication verifies artifact integrity; GPU and multi-node correctness require running the workloads described above.

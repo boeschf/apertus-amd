@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -65,8 +66,15 @@ def publish(image, source, provenance, store) -> Path:
     staging = store / ".staging"
     locks = store / ".locks"
     objects = store / "objects" / "sha256"
-    for directory in (staging, locks, objects):
-        directory.mkdir(parents=True, exist_ok=True)
+    # mkdir's mode is filtered by umask, including for intermediate parents.
+    # Setgid retains the publishing group; sticky protects other publishers' entries.
+    # Skip chmod when already configured: a group writer need not own the directory.
+    for directory, required in ((store, 0o3075), (objects.parent, 0o3075),
+                                (objects, 0o3075), (staging, 0o3070), (locks, 0o3070)):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        mode = stat.S_IMODE(directory.stat().st_mode)
+        if mode & required != required:
+            directory.chmod(mode | required)
     temporary = Path(tempfile.mkdtemp(prefix="publication-", dir=staging))
     lock = None
     try:

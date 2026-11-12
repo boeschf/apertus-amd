@@ -34,10 +34,33 @@ def inputs(tmp_path):
     return image, source, provenance, tmp_path / "store"
 
 
-def invoke(script, inputs, cwd):
+def invoke(script, inputs, cwd, *, umask=-1):
     image, source, provenance, store = inputs
     return subprocess.run([sys.executable, str(script), str(image), str(source), str(provenance), "--store", str(store)],
-                          cwd=cwd, capture_output=True, text=True)
+                          cwd=cwd, capture_output=True, text=True, umask=umask)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_team_publication_under_private_umask(inputs, tmp_path, existing):
+    store = inputs[3]
+    public = [store, store / "objects", store / "objects/sha256"]
+    if existing:
+        for directory in public:
+            directory.mkdir()
+            directory.chmod(0o2770)
+    result = invoke(SCRIPT, inputs, tmp_path, umask=0o077)
+    assert result.returncode == 0, result.stderr
+    image = Path(result.stdout.strip())
+    for directory in [*public, image.parent]:
+        assert directory.stat().st_mode & 0o055 == 0o055
+    for directory in public:
+        assert directory.stat().st_mode & 0o3775 == 0o3775
+    for artifact in image.parent.iterdir():
+        assert artifact.stat().st_mode & 0o044 == 0o044
+        assert artifact.stat().st_mode & 0o022 == 0
+        assert artifact.stat().st_gid == store.stat().st_gid
+    for shared in (store / ".staging", store / ".locks"):
+        assert shared.stat().st_mode & 0o7777 == 0o3770
 
 
 def test_copied_script_is_self_contained_and_idempotent(inputs, tmp_path):
