@@ -1,0 +1,48 @@
+# Native router-only captured-logit regression; not a model or EP16 run.
+# Cases explicitly vary score/method/padding/capacity inside the frozen validator.
+# Global batch 8 / world 4 gives two native metric-buffer microbatch slots.
+nodes = 1
+entrypoint = "pretrain_gpt.py"
+prepare = [["make", "-C", "megatron/core/datasets"]]
+args = [
+  "--num-layers", "42", "--hidden-size", "3584", "--ffn-hidden-size", "17280",
+  "--num-attention-heads", "28", "--normalization", "RMSNorm", "--disable-bias-linear",
+  "--seq-length", "4096", "--max-position-embeddings", "4096",
+  "--attention-dropout", "0", "--hidden-dropout", "0", "--init-method-std", "0.016703827619526525",
+  "--num-experts", "256", "--moe-router-topk", "8", "--moe-layer-freq", "1",
+  "--moe-ffn-hidden-size", "1920", "--moe-token-dispatcher-type", "alltoall",
+  "--moe-router-score-function", "sigmoid", "--moe-router-dtype", "fp32",
+  "--moe-router-topk-scaling-factor", "2.5", "--moe-router-load-balancing-type", "quantile_balancing",
+  "--moe-aux-loss-coeff", "0.0", "--moe-router-quantile-balancing-method", "histogram",
+  "--moe-router-quantile-balancing-ema", "0", "--moe-router-quantile-balancing-num-bins", "1000",
+  "--moe-router-violation-metrics", "mbs", "--transformer-impl", "transformer_engine",
+  "--tensor-model-parallel-size", "1", "--pipeline-model-parallel-size", "1",
+  "--context-parallel-size", "1", "--expert-model-parallel-size", "1",
+  "--expert-tensor-parallel-size", "1", "--micro-batch-size", "1", "--global-batch-size", "8",
+  "--bf16", "--no-gradient-accumulation-fusion", "--train-iters", "1", "--save-interval", "1",
+  "--seed", "42", "--mock-data", "--tokenizer-type", "NullTokenizer", "--vocab-size", "200063",
+  "--num-workers", "0", "--eval-iters", "0", "--distributed-timeout-minutes", "3",
+]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "e242f3c3c1136aeae498529bfde5e06bda9a7cca"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+NCCL_DEBUG = "INFO"
+NCCL_P2P_DISABLE = "1"
+NCCL_RUNTIME_CONNECT = "0"
+SS_BALLAST_GB = "0"
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+TORCH_COMPILE_DISABLE = "0"
+BEVERIN_COMM_WARMUP = "1"
+BEVERIN_COMM_WARMUP_PARTS = "ar,p2p,a2a"
+
+[procedure]
+kind = "train"
+validation = "../validation/router_tensor_probe.py"

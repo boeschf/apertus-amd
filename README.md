@@ -35,6 +35,8 @@ Without `--site`, commands read `config.toml` from the current directory.
 Edit `local.toml` for your Slurm account/partition, shared `data_root`, image store, and machine topology.
 The supplied topology is four GPUs/ranks per node, 192 logical CPUs, full allocatable memory, and one NUMA domain per rank.
 Ranks retain visibility of the allocated GPUs and select their device using their Slurm local rank.
+For training, the runner preserves and verifies the incoming calling-thread CPU mask across GPU initialization, then derives unset `OMP_NUM_THREADS` and `MAX_JOBS` defaults from that mask while retaining explicit overrides.
+Unexpected later mask changes fail before preparation or training children launch; this does not continuously enforce every library/helper thread's affinity.
 The CSCS site setting `uenv_passthrough = "ignore"` makes batch submission independent of a uenv loaded in the submitting shell.
 The generated container EDF sets `entrypoint = true` and launches a small Bash `exec` wrapper so the image's `BASH_ENV` initializes its runtime defaults, including Slingshot/libfabric settings.
 Use the site environment for intentional overrides.
@@ -49,6 +51,8 @@ The expected layout is `<store>/objects/sha256/<sha256>/{image.sqsh,manifest.jso
 Images supply training dependencies; the selected Megatron source is staged separately at runtime.
 The runner explicitly disables CSCS CXI/libfabric and AWS OFI injection so the image's built-in network libraries are used.
 Every generated EDF sets `com.hooks.cxi.enabled = "false"` and `com.hooks.aws_ofi_nccl.enabled = "false"` under `[annotations]`, for all images.
+It also sets `com.hooks.netstack.source = "host"` so the separate netstack hook skips its unused artifact mount before container startup.
+Despite that source name, the disabled injection hooks leave the image's pinned network libraries selected; this does not enable host-stack injection.
 It also sets `HWLOC_COMPONENTS = "-gl"` to prevent hwloc's OpenGL display discovery from blocking OFI initialization.
 See [Build and publish images](#build-and-publish-images) to add an image to this registry.
 
@@ -102,6 +106,8 @@ This workload uses image-provided executables and requires no Megatron checkout.
 Commands are attempted in independent Slurm steps, each bounded by the experiment's timeout, with per-rank logs and executable hashes under `output/<command-index>/`.
 `result.json` records all-rank command outcomes; inspect RCCL's numerical error count and complete size sweep separately from MPI timings.
 Compiler caching and training comparisons do not apply to this workload.
+Native commands may select an explicit Python `[procedure].validation` script, which is frozen, integrity-checked and mounted read-only at `/apertus/validation.py`.
+Such commands invoke the script explicitly; the runner does not automatically call its training or check modes.
 Effective transport settings are retained in `output/environment-<rank>.json` for training and in each command's output directory for native tests.
 `launch.json` records the host-side `SLURM_NETWORK` setting passed before `srun`.
 
@@ -120,6 +126,8 @@ It stores portable Triton kernel groups, compiled AITER modules, and source-matc
 Each rank restores these into a private cache in job-owned node-local scratch and compiles any missing specializations there.
 After execution and any requested checks pass, the runner collects supported artifacts and atomically publishes a new immutable cache generation.
 Mutable autotuning state and arbitrary build trees stay private.
+Image-baked AITER modules, when exposed through the image's `AITER_JIT_DIR`, seed each private cache without replacing compatible restored modules.
+Checks and publication have separate bounded stage waits, and publication runs in a monitored subprocess rather than sharing the short rank-rendezvous deadline.
 
 Cache mode defaults to `auto`: restore a compatible generation if available, otherwise start cold.
 `--cache-mode cold` bypasses restoration; `--cache-mode warm` requires an existing compatible generation.
@@ -159,7 +167,7 @@ Site settings belong in the site file, and reusable execution logic belongs in `
 
 Workload-specific instrumentation and checks live under `experiments/validation/`, shared by experiments that need the same validation.
 An optional `[procedure].validation` names a self-contained Python script relative to `experiment.toml`.
-The runner copies it into the run directory and calls `validation.py train OUTPUT SOURCE ENTRYPOINT [ARGS...]` for each training phase, then `validation.py check RUN` after all ranks finish.
+The runner copies it into the run directory; for training procedures it calls `validation.py train OUTPUT SOURCE ENTRYPOINT [ARGS...]` for each phase, then `validation.py check RUN` after all ranks finish.
 The training wrapper can call `apertus_amd.entrypoint.train(..., before_run=...)` to install its instrumentation while retaining the common source verification.
 The check command writes `RUN/output/checks.json` and must exit nonzero on failure; cache publication follows successful checks.
 For `--compare-run`, the validator also compares against `RUN/reference.json`.
@@ -184,6 +192,11 @@ The final image and evidence go to `--output`; `evidence/export-workspace.json` 
 The build script automatically works around the known Enroot Podman cleanup bug when it detects the affected helper, using a private library copy and recording the patch and hashes in the build evidence.
 It discovers the helper location from the installed Enroot launcher or honors `ENROOT_LIBRARY_PATH` for a custom installation.
 Actual export failures still fail the build, and publication requires a successful full filesystem-read check.
+On a failed import, the private Enroot workaround retains its temporary data and container for diagnosis; on a successful import, cleanup failures now fail the build rather than being hidden.
+For a separately supervised build, standalone `build.py --defer-export-cleanup` records exact cleanup objects in `evidence/deferred-cleanup.json` and leaves the export workspace and Enroot container intact.
+The caller must verify health and child-process quiescence before cleaning those objects and must enforce its requested cleanup checks before publication; the combined wrapper does not expose this option.
+For the audited Enroot daemon-import protocol, the private patch also moves inline container removal into that single cleanup owner; unknown daemon-import bodies are refused rather than partially patched.
+Python callers may also pass `phase_gate` to `build()` to refuse a named build/export/read step or automatic export-workspace cleanup before it starts.
 
 ### Build a base, then its application image
 

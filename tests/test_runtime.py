@@ -56,13 +56,16 @@ def test_interruption_waits_for_child_before_returning(tmp_path, monkeypatch):
         pid = 42
         def wait(self, timeout=None):
             events.append(("wait", timeout))
-            if timeout is None:
+            if len(events) == 1:
                 raise KeyboardInterrupt
+        def poll(self):
+            return 0
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: Process())
     monkeypatch.setattr(runtime.os, "killpg", lambda pid, sig: events.append(("kill", pid)))
+    monkeypatch.setattr(runtime, "group_running", lambda group: False)
     with pytest.raises(KeyboardInterrupt):
         runtime.child(["fixture"], tmp_path / "log", cwd=tmp_path, env={})
-    assert events == [("wait", None), ("kill", 42), ("wait", 10)]
+    assert events == [("wait", 0.1), ("kill", 42), ("wait", 0.1)]
 
 
 @pytest.fixture
@@ -103,6 +106,7 @@ def test_step_failure_retains_inputs_without_source_copies(prepared, tmp_path, m
     assert edf["env"]["HWLOC_COMPONENTS"] == "-gl"
     assert edf["annotations"]["com"]["hooks"]["cxi"]["enabled"] == "false"
     assert edf["annotations"]["com"]["hooks"]["aws_ofi_nccl"]["enabled"] == "false"
+    assert edf["annotations"]["com"]["hooks"]["netstack"]["source"] == "host"
 
 
 @pytest.mark.parametrize("reservation", [None, "cscs"])
@@ -178,6 +182,7 @@ def test_native_commands_submission_needs_no_source_or_cache(tmp_path, monkeypat
     assert edf["env"]["HWLOC_COMPONENTS"] == "-gl"
     assert edf["annotations"]["com"]["hooks"]["cxi"]["enabled"] == "false"
     assert edf["annotations"]["com"]["hooks"]["aws_ofi_nccl"]["enabled"] == "false"
+    assert edf["annotations"]["com"]["hooks"]["netstack"]["source"] == "host"
     assert not any(":/apertus/source" in mount or ":/apertus/cache" in mount for mount in edf["mounts"])
     assert not (tmp_path / "sources").exists() and not (tmp_path / "cache").exists()
 

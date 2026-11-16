@@ -17,9 +17,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from typing import Callable
 
 
 MANUAL_BUILD = Path("manual-build/manual-build.sh")
+# This installed daemon-import body removes its container both inline and in
+# EXIT. Moving only its audited inline operation keeps removal single-owned.
+ENROOT_DAEMON_IMPORT_SHA256 = "72f61f486bc751ca28f83d1e3e73d4f4f97770827ad4c70965cdc0960f1b65ba"
 
 
 def resolve_source(source: Path) -> Path:
@@ -85,8 +89,8 @@ def snapshot(source: Path, archive: Path) -> dict:
     return {**metadata, "archive_sha256": checksum}
 
 
-def enroot_cleanup_workaround(env: dict, evidence: Path) -> dict:
-    """Patch only Enroot's known daemon-import cleanup trap in a private library copy."""
+def enroot_cleanup_workaround(env: dict, evidence: Path, *, defer_cleanup: bool = False) -> dict:
+    """Patch audited cleanup privately; preserve failures or hand both objects to the caller."""
     configured = env.get("ENROOT_LIBRARY_PATH")
     if configured is None:
         executable = shutil.which("enroot", path=env.get("PATH"))
@@ -98,39 +102,96 @@ def enroot_cleanup_workaround(env: dict, evidence: Path) -> dict:
         # installation prefixes. Never source/evaluate configuration in Python.
         match = re.search(r'^config::export\s+ENROOT_LIBRARY_PATH\s+[\'\"]([^\'\"$`]+)[\'\"]\s*$', launcher, re.MULTILINE)
         if match is None:
+            if defer_cleanup:
+                raise ValueError("cannot defer cleanup for an undiscovered Enroot helper")
             return {"applied": False, "reason": "helper location not discovered"}
         configured = match[1]
     library = Path(configured)
     helper = library / "docker.sh"
     if not helper.is_file():
+        if defer_cleanup:
+            raise ValueError("cannot defer cleanup without the known Enroot helper")
         return {"applied": False}
     original = helper.read_text()
     old = '''trap 'common::rmall "${tmpdir}" 2> /dev/null; docker rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT'''
-    new = '''trap 'status=$?; common::rmall "${tmpdir}" 2> /dev/null || true; "${engine}" rm -f -v "${tmpdir##*/}" > /dev/null 2>&1 || true; exit "${status}"' EXIT'''
-    record = {"applied": False, "original_sha256": hashlib.sha256(original.encode()).hexdigest()}
+    inline = '    "${engine}" rm "${PWD##*/}"'
+    patched_input = original
+    protocol = {}
+    if inline in original or "docker::daemon::import()" in original:
+        bodies = list(re.finditer(r'^docker::daemon::import\(\) \(\n.*?^\)$', original, re.MULTILINE | re.DOTALL))
+        if len(bodies) != 1 or hashlib.sha256(bodies[0].group().encode()).hexdigest() != ENROOT_DAEMON_IMPORT_SHA256:
+            raise ValueError("cannot change inline cleanup for an unaudited Enroot daemon-import protocol")
+        body = bodies[0]
+        if original.count(inline) != 1 or body.group().count(old) != 1:
+            raise ValueError("ambiguous Enroot inline/trap cleanup ownership")
+        replacement = body.group().replace(inline, '    # Container cleanup is owned by the private EXIT trap.', 1)
+        patched_input = original[:body.start()] + replacement + original[body.end():]
+        protocol = {"daemon_import_sha256": ENROOT_DAEMON_IMPORT_SHA256,
+                    "inline_container_cleanup": "deferred" if defer_cleanup else "moved-to-exit-trap"}
+    if defer_cleanup:
+        env["APERTUS_ENROOT_CLEANUP_RECORD"] = str(evidence / "enroot-cleanup-request.nul")
+        # A single NUL-delimited append preserves arbitrary path bytes without a
+        # parser/subprocess in the trap; multiple invocations are rejected below.
+        new = '''trap 'status=$?; printf "%s\\0" "${status}" "${tmpdir}" "${engine}" "${tmpdir##*/}" >> "${APERTUS_ENROOT_CLEANUP_RECORD}" || { cleanup_status=$?; if [ "${status}" -eq 0 ]; then status=${cleanup_status}; fi; }; exit "${status}"' EXIT'''
+    else:
+        # Failed imports retain their workspace/container for diagnosis. Successful
+        # imports must not hide a failed filesystem or engine cleanup operation.
+        # Enroot's cwd is tmpdir: run the external engine before removing it.
+        # Attempt both cleanups, retaining filesystem-error precedence if both fail.
+        new = '''trap 'status=$?; if [ "${status}" -eq 0 ]; then cleanup_status=0; "${engine}" rm -f -v "${tmpdir##*/}" > /dev/null 2>&1 || { cleanup_status=$?; printf "%s\\n" "Enroot container cleanup failed" >&2; }; common::rmall "${tmpdir}" 2> /dev/null || { cleanup_status=$?; printf "%s\\n" "Enroot temporary cleanup failed" >&2; }; status=${cleanup_status}; fi; exit "${status}"' EXIT'''
+    record = {"applied": False, "original_sha256": hashlib.sha256(original.encode()).hexdigest(), **protocol}
+    if defer_cleanup and original.count(old) != 1:
+        raise ValueError("cannot defer cleanup for an unknown Enroot trap")
     if original.count(old) == 1:
         # Never modify the installed library or blanket-ignore an import failure.
-        # The trap selects Podman and preserves the pre-cleanup exit status.
+        # The trap selects Podman and never turns a failed import into success.
         private = evidence / "enroot-library"
         shutil.copytree(library, private)
-        patched = original.replace(old, new, 1)
+        patched = patched_input.replace(old, new, 1)
         (private / "docker.sh").write_text(patched)
         (evidence / "enroot-cleanup.patch").write_text("".join(difflib.unified_diff(
             original.splitlines(True), patched.splitlines(True), fromfile="original/docker.sh", tofile="patched/docker.sh")))
         env["ENROOT_LIBRARY_PATH"] = str(private)
-        record.update(applied=True, patched_sha256=hashlib.sha256(patched.encode()).hexdigest())
+        record.update(applied=True, patched_sha256=hashlib.sha256(patched.encode()).hexdigest(),
+                      cleanup="deferred" if defer_cleanup else "strict-on-success")
         print(f"Enroot cleanup workaround: {private}", file=sys.stderr, flush=True)
     write_json(evidence / "enroot-cleanup.json", {"library": str(library), **record})
     return record
 
 
+def deferred_cleanup_request(evidence: Path, workspace: Path, env: dict) -> dict:
+    """Validate the exact deferred Enroot objects without probing or cleaning their paths."""
+    path = evidence / "enroot-cleanup-request.nul"
+    with path.open("rb") as stream:
+        raw = stream.read(65537)
+    fields = raw.split(b"\0")
+    if len(raw) > 65536 or len(fields) != 5 or fields[-1] or fields[0] != b"0":
+        raise ValueError("missing, failed or ambiguous deferred Enroot cleanup request")
+    _, directory, engine, container, _ = (os.fsdecode(value) for value in fields)
+    target = Path(directory)
+    expected_engine = shutil.which("podman", path=env.get("PATH"))
+    if not target.is_absolute() or ".." in target.parts or not target.is_relative_to(workspace) or \
+            container != target.name or engine not in ("podman", expected_engine):
+        raise ValueError("deferred Enroot cleanup objects escape the owned export workspace")
+    record = {"status": "deferred; caller must verify health and quiescence before cleanup",
+              "workspace": str(workspace), "enroot_directory": directory,
+              "engine": engine, "container_name": container}
+    write_json(evidence / "deferred-cleanup.json", record)
+    return record
+
+
 def build(source: Path, output: Path, selector: list[str], *, processors: int = 4,
-          isolation: str = "oci") -> dict:
+          isolation: str = "oci", defer_export_cleanup: bool = False,
+          phase_gate: Callable[[str], None] | None = None) -> dict:
     """Snapshot, build, and export into a new directory; retain evidence on failure.
 
     Podman storage and the build allocation belong to the caller.
     Only successful exports with a full filesystem read receive provenance.json,
     the final input required by the standalone publisher.
+    Opt-in deferred cleanup retains the export workspace and records exact Enroot
+    objects; the caller owns their health/quiescence checks and later cleanup.
+    An optional caller gate runs before every named build step and automatic
+    export-workspace cleanup; raising stops before that operation or completion.
     """
     if not ((len(selector) == 4 and selector[0] == "base") or
             (len(selector) == 3 and selector[0] == "app")):
@@ -167,6 +228,8 @@ def build(source: Path, output: Path, selector: list[str], *, processors: int = 
     commands = []
 
     def run(name, command, *, stdout=None):
+        if phase_gate is not None:
+            phase_gate(name)
         print(f"{name}: {evidence / (name + '.log')}", file=sys.stderr, flush=True)
         step = {"name": name, "argv": command, "cwd": str(context)}
         commands.append(step)
@@ -226,13 +289,18 @@ bash "$1"
     env["ENROOT_TEMP_PATH"] = str(temporary)
     write_json(evidence / "export-workspace.json", {"path": str(temporary)})
     print(f"Export workspace: {temporary}", file=sys.stderr, flush=True)
-    cleanup_workaround = enroot_cleanup_workaround(env, evidence)
+    cleanup_workaround = enroot_cleanup_workaround(env, evidence, defer_cleanup=defer_export_cleanup)
     run("export", ["enroot", "import", "-x", "tar", "-o", str(image), f"podman://{image_id}"])
+    if defer_export_cleanup:
+        deferred_cleanup_request(evidence, temporary, env)
     # -pf emits the entire filesystem data stream; discard data but retain errors.
     run("full-read", ["unsquashfs", "-no-progress", "-processors", str(processors),
                       "-data-queue", "32", "-frag-queue", "32", "-pf", "-", str(image)],
         stdout=subprocess.DEVNULL)
-    shutil.rmtree(temporary)
+    if not defer_export_cleanup:
+        if phase_gate is not None:
+            phase_gate("cleanup-export")
+        shutil.rmtree(temporary)
     record = {
         "source": metadata, "recipe": flags.f, "build_args": build_args,
         "canonical_ref": canonical, "id": canonical.rsplit("/", 1)[-1],
@@ -240,15 +308,21 @@ bash "$1"
         "image_manifest_digest": inspected.get("Digest"),
         "image_labels": inspected.get("Labels") or inspected.get("Config", {}).get("Labels"),
         "build_options": {"isolation": isolation},
-        "export_options": {"extract_mode": "tar", "enroot_cleanup": cleanup_workaround}, "settings": settings,
+        "export_options": {"extract_mode": "tar", "enroot_cleanup": cleanup_workaround,
+                           "cleanup": "deferred" if defer_export_cleanup else "completed"}, "settings": settings,
         "validation": {"squashfs_full_read": "passed", "runtime": "not tested"},
     }
+    if phase_gate is not None:
+        record["build_options"]["external_phase_gate"] = True
     # This record is the completion marker. Failures above leave diagnostic inputs
     # and logs, but never a bundle that publish.py can accept.
     write_json(output / "provenance.json", record)
-    return {"id": record["id"], "output": str(output),
-            "image": str(image), "source": str(archive),
-            "provenance": str(output / "provenance.json")}
+    result = {"id": record["id"], "output": str(output),
+              "image": str(image), "source": str(archive),
+              "provenance": str(output / "provenance.json")}
+    if defer_export_cleanup:
+        result["deferred_cleanup"] = str(evidence / "deferred-cleanup.json")
+    return result
 
 
 def argument_parser(description: str = __doc__, *, include_output: bool = True) -> argparse.ArgumentParser:
@@ -258,6 +332,8 @@ def argument_parser(description: str = __doc__, *, include_output: bool = True) 
     if include_output:
         parser.add_argument("--output", type=Path, help="build output directory (required unless --list)")
         parser.add_argument("--list", action="store_true", help="list repository build selectors without building")
+        parser.add_argument("--defer-export-cleanup", action="store_true",
+                            help="retain export workspace/container for caller-managed monitored cleanup")
     parser.add_argument("--processors", type=int, default=4, help="SquashFS export/read workers (default: 4)")
     parser.add_argument("--isolation", choices=("oci", "chroot"), default="oci")
     parser.add_argument("selector", nargs="*" if include_output else "+",
@@ -279,7 +355,8 @@ def main() -> None:
             list_candidates(args.source)
             return
         result = build(args.source, args.output, args.selector,
-                       processors=args.processors, isolation=args.isolation)
+                       processors=args.processors, isolation=args.isolation,
+                       defer_export_cleanup=args.defer_export_cleanup)
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError,
             tarfile.TarError, argparse.ArgumentError) as error:

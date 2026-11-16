@@ -1,0 +1,28 @@
+# Frozen native activation component only; pretrain_gpt.py is verified, NOT executed.
+# Requires --cache-mode cold. Four independent local GPUs; no process groups/model/optimizer.
+# DISTINCT registered-backend transport; rejects the failed ambient assignment policy.
+nodes = 1
+entrypoint = "pretrain_gpt.py"
+prepare = []
+args = []
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "1072583a9632fd1902544f7eaea562e2578ef1de"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+TORCH_COMPILE_DISABLE = "0"
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+NCCL_P2P_DISABLE = "1"
+APERTUS_INDUCTOR_POLICY = "single_candidate_backend"
+APERTUS_SSSGLU_TIMEOUT_SECONDS = "900"
+TORCH_LOGS = "recompiles,graph_breaks"
+
+[procedure]
+kind = "train"
+validation = "../validation/sssglu_compile_probe.py"

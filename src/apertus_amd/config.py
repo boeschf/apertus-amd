@@ -64,8 +64,8 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     validation = None
     if "validation" in procedure:
         script = (path.parent / procedure["validation"]).resolve()
-        if procedure["kind"] == "commands" or script.suffix != ".py" or not script.is_file():
-            raise ValueError("training validation requires an existing Python script")
+        if script.suffix != ".py" or not script.is_file():
+            raise ValueError("validation requires an existing Python script")
         validation = {"path": str(script), "sha256": sha256(script)}
     if procedure["kind"] == "restart" and validation is None:
         raise ValueError("restart procedure requires an explicit validation script")

@@ -1,0 +1,21 @@
+# CPU tensor work only; one reserved GPU/rank is planned but unused by this fixture.
+# Requires --gpus-per-node 1 --cpus-per-task 4 --time 00:05:00; no training cache mode.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+APERTUS_INDUCTOR_POLICY = "single_candidate_backend"
+TORCH_COMPILE_DISABLE = "0"
+TENSORIFY_PYTHON_SCALARS = "1"
+APERTUS_RESTART_CPU_TIMEOUT_SECONDS = "150"
+OMP_NUM_THREADS = "4"
+MAX_JOBS = "4"
+
+[procedure]
+kind = "commands"
+validation = "../validation/sssglu_compile_probe.py"
+timeout = 180
+commands = [["python3", "-u", "/apertus/validation.py", "restart-cpu", "/apertus/output/0"]]

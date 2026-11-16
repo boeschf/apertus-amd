@@ -54,10 +54,12 @@ def edf(value: dict, directory: Path) -> str:
     if any("$" in str(v) for v in [*values.values(), *env.values()]):
         raise ValueError("EDF settings must not contain interpolation")
     # Alps images contain their complete network stack. Site injection would
-    # replace those pinned libraries with a different host-provided build.
+    # replace those pinned libraries with a different host-provided build. The
+    # separate netstack hook otherwise mounts an unused artifact before either
+    # injection hook runs; its "host" source skips that mount, not these guards.
     return "\n".join(f"{k} = {json.dumps(v)}" for k, v in values.items()) + "\n\n[env]\n" + \
         "\n".join(f"{k} = {json.dumps(v)}" for k, v in env.items()) + \
-        '\n\n[annotations]\ncom.hooks.cxi.enabled = "false"\ncom.hooks.aws_ofi_nccl.enabled = "false"\n'
+        '\n\n[annotations]\ncom.hooks.cxi.enabled = "false"\ncom.hooks.aws_ofi_nccl.enabled = "false"\ncom.hooks.netstack.source = "host"\n'
 
 
 def batch_script(value: dict, directory: Path) -> str:

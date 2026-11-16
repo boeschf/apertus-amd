@@ -1,0 +1,52 @@
+# PREPARATION ONLY: no launch approval; native EP8 component, NOT full KDA acceptance.
+# Capture-only canonical projection boundaries; all original combine8 numerical gates remain authoritative.
+# EP8-only hypothesis: existing API combine RDMA-send6->8, not a qualified fix or EP16 default.
+# Parent must request --reservation cscs --time 00:30:00; exec GNU foreground timeout 660s + kill-after 10s.
+# Normal checked/quiescent train-cache publication is parent-approved for this candidate namespace.
+nodes = 2
+entrypoint = "pretrain_gpt.py"
+prepare = [["make", "-C", "megatron/core/datasets"]]
+args = [
+  "--num-layers", "42", "--hidden-size", "3584", "--ffn-hidden-size", "17280",
+  "--num-attention-heads", "28", "--normalization", "RMSNorm", "--disable-bias-linear", "--sssglu",
+  "--seq-length", "4096", "--max-position-embeddings", "4096", "--attention-dropout", "0", "--hidden-dropout", "0",
+  "--init-method-std", "0.016703827619526525", "--enable-experimental",
+  "--num-experts", "256", "--moe-router-topk", "8", "--moe-layer-freq", "1",
+  "--moe-ffn-hidden-size", "1920", "--moe-latent-size", "1792", "--moe-shared-expert-intermediate-size", "1920",
+  "--moe-grouped-gemm", "--moe-permute-fusion", "--moe-token-dispatcher-type", "alltoall",
+  "--moe-flex-dispatcher-backend", "deepep", "--moe-router-score-function", "sigmoid", "--moe-router-dtype", "fp32",
+  "--moe-router-topk-scaling-factor", "2.5", "--moe-router-load-balancing-type", "quantile_balancing",
+  "--moe-aux-loss-coeff", "0.0", "--moe-router-quantile-balancing-method", "histogram",
+  "--moe-router-quantile-balancing-ema", "0", "--moe-router-quantile-balancing-num-bins", "1000",
+  "--moe-router-violation-metrics", "mbs", "--transformer-impl", "transformer_engine",
+  "--tensor-model-parallel-size", "1", "--pipeline-model-parallel-size", "1", "--context-parallel-size", "1",
+  "--expert-model-parallel-size", "8", "--expert-tensor-parallel-size", "1",
+  "--micro-batch-size", "1", "--global-batch-size", "16", "--bf16", "--main-grads-dtype", "fp32",
+  "--recompute-granularity", "selective", "--recompute-modules", "moe", "--no-gradient-accumulation-fusion",
+  "--no-overlap-p2p-communication", "--train-iters", "1", "--save-interval", "1", "--seed", "42",
+  "--mock-data", "--tokenizer-type", "NullTokenizer", "--vocab-size", "200063", "--make-vocab-size-divisible-by", "128",
+  "--num-workers", "0", "--eval-iters", "0", "--distributed-timeout-minutes", "3",
+]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "e242f3c3c1136aeae498529bfde5e06bda9a7cca"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "2"
+NCCL_P2P_DISABLE = "1"
+UCCL_EP_TRANSPORT = "cxi"
+UCCL_SOCKET_IFNAME = "hsn"
+UCCL_CXI_THREADING = "safe"
+UCCL_EP_COMBINE_CONFIG = "20,4,256,8,128"
+TORCH_COMPILE_DISABLE = "0"
+
+[procedure]
+kind = "train"
+validation = "../validation/native_dispatcher_boundary_capture_probe.py"

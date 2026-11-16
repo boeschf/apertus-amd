@@ -96,6 +96,7 @@ The supplied site configuration enables RCCL P2P with `NCCL_P2P_DISABLE=0` and e
 The allocator-only and compile-disable-only arms explicitly disable P2P and should be compared with the combined-settings P2P-disabled control below.
 All retain the Open MPI patcher exclusion.
 All select [validation/memory_trace.py](validation/memory_trace.py), which samples process memory, available cgroup counters, GPU allocator counters, and node/shared-memory usage every ten seconds, with private-cache sizes every minute.
+Newly frozen runs also retain node-level buddyinfo and the base page size every ten seconds, without allocating memory or treating fragmentation as a run-admission check.
 It preserves ordinary verified source execution and does not synchronize GPU work or reset memory peaks.
 The `memory-start-<rank>.json`, `memory-<rank>.jsonl`, and `memory-end-<rank>.json` artifacts retain effective settings and memory evidence, including partial traces after a killed process.
 Its final check verifies telemetry completeness and configured settings; it does not validate numerical equivalence or checkpoint contents.
@@ -117,6 +118,138 @@ Warm mode restores portable Triton objects, AITER modules, and dataset helpers; 
 Compare early-step compilation and late-step throughput separately.
 
 The [performance plan](PERFORMANCE.md) covers the Mid-4B reference comparison and the separate Chonk baseline.
+
+### Advisory node observations
+
+Use `uv run --locked python -B -m apertus_amd.node_screen survey --reservation cscs` from a shell without an inherited allocation context for a bounded, immediate CPU-only survey.
+It records raw buddy orders, GPU-local NUMA topology/memory, uptime and skipped busy/unreachable nodes under `artifacts/investigations/performance-next/node-screening/`.
+The survey never waits for ideal nodes or controls benchmark admission; refresh it periodically without rerunning historical benchmarks.
+Inside an explicitly owned CPU-only scheduler step, `python -B -m apertus_amd.node_screen sample --samples 3 --interval 10` emits bounded periodic snapshots instead.
+Do not use intrusive allocation-based capacity probes on nodes concurrently running benchmarks.
+
+### Independent fusion and recomputation trials
+
+[moe-chonk-kda-gaf-m1072583a9632-icb5a384016a9](moe-chonk-kda-gaf-m1072583a9632-icb5a384016a9/experiment.toml) removes only the baseline's `--no-gradient-accumulation-fusion` argument, selecting native enabled accumulation fusion.
+[moe-chonk-kda-moeact-m1072583a9632-icb5a384016a9](moe-chonk-kda-moeact-m1072583a9632-icb5a384016a9/experiment.toml) replaces only `moe` with `moe_act` in selective recomputation, retaining `layernorm linear_attn` and disabled fusion.
+Both retain the baseline's P2P-disabled environment and 60-update measurement/checkpoint duration, making them independent of PR #73 restoration.
+The args-only changes share the existing cache compatibility namespace; this does not guarantee reuse of new specializations or arbitrary Apex Torch-extension builds.
+The optional [grouped-linear probe](validation/grouped_linear_probe.py) checks selected image backend forward/input gradients and multi-microbatch accumulated weight gradients against FP32 references.
+[chonk-grouped-linear-probe-icb5a384016a9](chonk-grouped-linear-probe-icb5a384016a9/experiment.toml) runs that frozen script as a bounded native command on one node, with a private temporary compiler cache per rank.
+Its per-rank numerical reports are under `output/0/grouped-linear-probe-<rank>.json`; inspect these separately from scheduler exits.
+It is not a full-model, routing, SSSGLU, recomputation, optimizer or restart-equivalence validator.
+Training telemetry alone does not establish numerical equivalence or justify accepting either optimization.
+
+[chonk-apex-wgrad-probe-icb5a384016a9](chonk-apex-wgrad-probe-icb5a384016a9/experiment.toml) independently tests the installed native Apex FP32-accumulating weight-gradient operation used by the TP1 LM head.
+It separates private extension JIT/load, CPU call duration, synchronized GPU timing and additive-reference checks for a small control followed by the exact input4096x3584/output-gradient4096x200064 shape.
+Each rank makes three native calls per shape, including nonzero initialization and cancellation, with tiled FP32 references and a 600-second command bound.
+Incremental `output/0/apex-wgrad-probe-<rank>.jsonl` and live JSON retain the last phase if an operation or reference stalls.
+The probe leaves Apex's audited workspace handling unchanged and does not establish distributed optimizer, stream-lifetime or full-model correctness.
+
+[moe-recompute-probe-m1072583a9632-icb5a384016a9](moe-recompute-probe-m1072583a9632-icb5a384016a9/experiment.toml) is a four-node/16-GPU single-MoELayer component proxy, not full Chonk training.
+It retains actual Chonk expert/latent/hidden widths, EP16 and native TEGroupedMLP/SSSGLU/histogram routing, but uses PP1 and two microbatches per native recomputation mode.
+Its explicit validator initializes and verifies committed Megatron imports, constructs layer 4 only, and compares `moe` with `moe_act` from identical weights, inputs and RNG.
+It checks outputs, input/all-parameter gradients, local FP32 accumulation of BF16 leaf gradients, routing/state/RNG and once-per-microbatch accounting.
+The pinned `pretrain_gpt.py` is verified but not executed; no GPT model, optimizer, DDP reduction, beta-finalization, checkpoint or restart equivalence is claimed.
+Per-rank numerical evidence is `output/moe-recompute-<rank>.json` and JSONL; all ranks must pass the explicit checker before cache publication.
+The diagnostic reports also retain native original/replay/candidate logits/routing fingerprints, pre/post-backward output comparisons and bounded raw rows for routing differences.
+Detached top8/top9-prefix controls distinguish boundary-tie branch differences; they do not replace native routing or relax its equivalence gates.
+Diagnostic snapshots and hashing can synchronize execution and are not performance instrumentation.
+
+[moe-recompute-probe-me242f3c3c113-icb5a384016a9](moe-recompute-probe-me242f3c3c113-icb5a384016a9/experiment.toml) changes only the source pin to the user-committed histogram checkpoint-routing fix.
+It retains the original EP16 proxy workload, image, compilation, disabled P2P, numerical tolerances and exact routing/state/once-only accounting gates.
+Diagnostic branch metadata follows the selected committed source; the observer does not replace native routing.
+This experiment provides component validation, not full-model correctness or an accepted recomputation optimization.
+Tied-boundary regression and inference/non-histogram compatibility remain separate acceptance requirements.
+
+[moe-chonk-kda-me242f3c3c113-icb5a384016a9](moe-chonk-kda-me242f3c3c113-icb5a384016a9/experiment.toml) and [moe-chonk-kda-moeact-me242f3c3c113-icb5a384016a9](moe-chonk-kda-moeact-me242f3c3c113-icb5a384016a9/experiment.toml) prepare the full 60-update recomputation comparison with the same committed routing fix on both sides.
+They preserve the original default compiler policy, disabled P2P, disabled accumulation fusion and preselected update windows; the pair differs only by `moe` versus `moe_act`.
+Do not interpret corrected-versus-historical training differences as a pure recomputation speedup.
+Preparation and pure planning do not authorize these runs or establish full-model numerical correctness; compiler-control and repetition-protocol review remain separate gates.
+
+[moe-chonk-kda-me242f3c3c113-i910bfcf936d3](moe-chonk-kda-me242f3c3c113-i910bfcf936d3/experiment.toml) changes only the published image identity for the full16-node/64-GPU ordinary-alltoall baseline workload.
+It keeps full-MoE recomputation, default compilation, P2P disabled and accumulation fusion off, with60updates/checkpoint60 and AUTOcache in the new image namespace.
+It tests installed-image integration and quiescent seed/cache publication, not matched-warm image speedup, native UCCL equivalence, checkpoint tensor integrity or production readiness.
+
+### PR #73: restore P2P without the disable workaround
+
+[collectives-pr73-icb5a384016a9](collectives-pr73-icb5a384016a9/experiment.toml) tests the complete relevant PR #73 settings on the existing newer Primus 26.8 image, explicitly setting `NCCL_P2P_DISABLE=0`.
+It runs checked RCCL all-reduce, all-to-all, variable all-to-all and repeated send/receive size sweeps in separate bounded steps.
+Default two-node execution exercises intra-node IPC and inter-node CXI; use `--nodes 1` for the separate intra-node arm.
+Inspect numerical error counts, actual P2P connections, final exits and effective environment before proceeding to 16-node Chonk.
+Collective success alone does not resolve the previous full-workload memory-pressure stall or establish a throughput gain.
+The objective is reliable full-model training without needing `NCCL_P2P_DISABLE=1`; individual flag ablations follow only if diagnosis or simplification requires them.
+
+[moe-chonk-kda-pr73-m1072583a9632-icb5a384016a9](moe-chonk-kda-pr73-m1072583a9632-icb5a384016a9/experiment.toml) retains the full 60-update KDA baseline and changes only the relevant network environment.
+Run it after collective correctness passes, retaining ordinary full-MoE recomputation and disabled accumulation fusion so the P2P restoration is assessed independently.
+Record actual IPC connections, memory/progress, checkpoints and finalization separately; do not accept a stalled run just because the synthetic collectives passed.
+
+[moe-chonk-kda-pr73act-m1072583a9632-icb5a384016a9](moe-chonk-kda-pr73act-m1072583a9632-icb5a384016a9/experiment.toml) is the short 26-update follow-up that replaces only whole-MoE recomputation with `moe_act`, preserving the PR #73 environment and full geometry.
+It isolates the interaction with backward recomputation seen in the stalled PR #73 trial; it is not a 60-update performance repetition or an accepted combined optimization.
+The independent `moeact` experiment above uses the original baseline environment and is not its exact single-variable P2P control.
+
+[moe-chonk-kda-pr73act-nop2p-m1072583a9632-icb5a384016a9](moe-chonk-kda-pr73act-nop2p-m1072583a9632-icb5a384016a9/experiment.toml) is the exact 26-update matched control, changing only `NCCL_P2P_DISABLE=1` from `pr73act`.
+All other PR #73 flags, recomputation, geometry, compilation and duration are identical, isolating a P2P-dependent interaction without attributing it to a particular transport operation.
+[moe-chonk-kda-pr73-eager-m1072583a9632-icb5a384016a9](moe-chonk-kda-pr73-eager-m1072583a9632-icb5a384016a9/experiment.toml) separately retains PR #73/full-MoE settings with `TORCH_COMPILE_DISABLE=1` and a documented shorter 26-update train/save duration.
+It tests a compilation interaction; it is not a performance comparison or proof that every kernel path is eager.
+
+[sssglu-compile-probe-m1072583a9632-icb5a384016a9](sssglu-compile-probe-m1072583a9632-icb5a384016a9/experiment.toml) independently checks an explicit experimental Inductor single-candidate policy against tiled FP64 references for native SSSGLU forward/input/probability gradients.
+It uses one node/four independent GPUs, cold empty caches, nine dense/shared/expert contiguous/strided cases and repeated direct/custom-autograd calls without executing GPT, process groups or an optimizer.
+The checker requires compiled-launch observations, singleton candidates and no benchmark calls as well as fixed numerical gates; its900-second watchdog is separate from the scheduler bound.
+[moe-chonk-kda-pr73-sc-m1072583a9632-icb5a384016a9](moe-chonk-kda-pr73-sc-m1072583a9632-icb5a384016a9/experiment.toml) is the full 26-update counterpart, retaining native compilation and selecting `APERTUS_INDUCTOR_POLICY=single_candidate_backend` relative to the compiled PR #73 full-MoE geometry/settings at the shorter duration.
+The selected validator applies and records this policy before native imports, while an absent policy preserves baseline compiler behavior.
+Component checks must pass before the full diagnostic is launched; neither establishes recomputation/router equivalence or justifies accepting changed reduction rounding/performance without further checks.
+
+[moe-chonk-kda-pr73-sc-gaf-profile-m1072583a9632-icb5a384016a9](moe-chonk-kda-pr73-sc-gaf-profile-m1072583a9632-icb5a384016a9/experiment.toml) enables native gradient-accumulation fusion on that same full-model registered-backend configuration and adds first-update CPU/GPU profiling on ranks 0/16/32/48.
+Its purpose is startup/backward attribution, not throughput measurement or numerical-equivalence acceptance.
+The native profiler exports after the first update returns and therefore does not guarantee a durable partial GPU trace during a hung backward; its later NVTX instrumentation also remains native and is not claimed bounded.
+Use a predeclared first-update decision deadline, inspect actual trace coverage/correlations and retain compiler/checkpoint/finalization outcomes independently.
+
+[chonk-kda-projection-tune-icb5a384016a9](chonk-kda-projection-tune-icb5a384016a9/experiment.toml) isolates the unchanged source-derived 4096×3584→11036 KDA projection through native TE forward, dgrad and FP32 accumulated wgrad, with a separately labeled unfused control.
+It uses disposable TE tuning outputs, fresh-process default/replay phases, independent numerical references and exact native cache/selected-algorithm consumption gates; it neither changes vendor libraries nor validates a captured full-training layout.
+The default `installed-sources` mode rejects missing or drifted native sources; the explicit experiment instead selects `pinned-image-build-provenance`, checking immutable image/build-info/ELF identities and actual mapped TE libraries without claiming source-to-binary attestation.
+Both modes retain the same numerical and table-consumption gates, and numerical failure stops before tuning or timing acceptance.
+Component timing, cache consumption and numerical success remain separate from full-model equivalence or training-speedup acceptance.
+
+[chonk-kda-projection-failure-capture-icb5a384016a9](chonk-kda-projection-failure-capture-icb5a384016a9/experiment.toml) stops at the projection probe's default-prefix unfused accumulation gate, preserving its original numerical failure rather than tuning or timing.
+It retains bounded raw BF16 input vectors, native and reference contribution bits, and independent copy/add diagnostics for exact offline analysis without additional native GEMMs.
+Select the explicit five-minute `cscs` launch envelope; capture completion or nonreproduction is not numerical acceptance and never authorizes tuning or a retry.
+
+[chonk-te-source-inventory-icb5a384016a9](chonk-te-source-inventory-icb5a384016a9/experiment.toml) inventories fixed TE source paths, distribution records, build metadata and scoped ELF-file identities on the existing immutable image without importing vendor code or using GPUs.
+It requires explicit five-minute/2-GiB site overrides; file absence or mismatched provenance is retained as an observation rather than an inventory-execution failure.
+Inventory success does not waive the projection probe's source gate, select runtime-loaded libraries or attest binary/source correspondence.
+
+[combined-uccl-aiter-components-i910bfcf936d3](combined-uccl-aiter-components-i910bfcf936d3/experiment.toml) selects the published combined candidate for two serial, bounded two-node/eight-rank component checks: private-copy AITER core reuse/RMSNorm, then exact UCCL dispatch/combine and post-destroy storage/stream/RCCL lifetime.
+The selected wrapper pins embedded scripts/seed metadata, preserves four visible devices and chooses the Slurm local GPU before executing each embedded test in the same process.
+It does not source the broad reference-optimization environment, change vendor code or publish compiler caches.
+The UCCL test uses a deterministic 32-token/hidden-512 proxy; passing it would not establish autograd, the Megatron dispatcher, Chonk geometry, full-model training or performance acceptance.
+
+[combined-aiter-attention-i910bfcf936d3](combined-aiter-attention-i910bfcf936d3/experiment.toml) separately checks direct AITER causal BF16 attention forward/backward at `[1,128,2,128]`, without selecting the bundled Turbo/FP8/reference environment.
+It preserves the candidate's existing forward tolerance and pinned backward policy against CPU FP64 SDPA plus an independent BF16 math control, retaining original elementwise gradient mismatch counts.
+Each rank selects its local GPU and uses private JIT caches; passing this small attention component would not validate the complete reference Turbo stack, native dispatcher or full training geometry.
+
+[combined-aiter-attention-parallel-i910bfcf936d3](combined-aiter-attention-parallel-i910bfcf936d3/experiment.toml) retains that attention workload and numerical policy while changing only private-build concurrency from two to eight workers per rank and enabling verbose AITER build logs.
+It rejects unexpected prebuild-thread division and Ninja-consumer source drift, retains the original 720-second command/15-minute allocation bounds, and does not promise compilation completion or authorize automatic retries.
+
+[combined-aiter-attention-workers16-i910bfcf936d3](combined-aiter-attention-workers16-i910bfcf936d3/experiment.toml) is a separately reviewed sixteen-worker compiler-concurrency candidate after the eight-worker forward build exhausted most of the unchanged command budget.
+It preserves the numerical workload, source/image/seed pins, private-cache ownership and 720-second/15-minute limits; CPU checks do not establish its memory peak or GPU numerical acceptance.
+
+[native-dispatcher-me242f3c3c113-i910bfcf936d3](native-dispatcher-me242f3c3c113-i910bfcf936d3/experiment.toml) compares native ordinary-alltoall and flex/deepep MoELayers through two full-MoE-recomputed forward/backward microbatches on two nodes/eight GPUs.
+It retains Chonk hidden3584/latent1792/expert1920 geometry, real routing and experts, all parameter/input/probability gradients, explicit local FP32 gradient sums, metadata coverage and post-buffer-destruction storage/RCCL checks.
+The source-staged train/check lifecycle uses cold private caches and ordinary checked publication; a direct-exec GNU foreground timeout bounds the worker to660seconds in the outer supervisor's process group under a separately selected30-minute `cscs` allocation.
+EP8 success would not establish production PP4/VPP2/EP16 geometry, Megatron DDP/main_grad equivalence, full-model correctness or throughput acceptance.
+
+[native-dispatcher-combine8-me242f3c3c113-i910bfcf936d3](native-dispatcher-combine8-me242f3c3c113-i910bfcf936d3/experiment.toml) preserves that native component and numerical policy while explicitly selecting the supported EP8 combine configuration `20,4,256,8,128`.
+It records and checks effective configuration getters before hints and after work, rejects dispatch overrides, and tests the source-derived send6→8 correction without patching the library or silently applying it to production EP16 defaults.
+
+[native-dispatcher-boundary-me242f3c3c113-i910bfcf936d3](native-dispatcher-boundary-me242f3c3c113-i910bfcf936d3/experiment.toml) preserves every combine8 numerical gate while observing canonical source-oriented latent-projection inputs, outputs and replay gradients.
+It retains raw bits for64 deterministic source tokens per boundary in owned snapshots capped at64MiB/rank, serializing only after all native backwards at the existing quiescent boundary.
+Capture completion is diagnostic evidence, not numerical acceptance; contributor reconstruction remains blocked by unproved permutation/source-token maps, and no failed result or tolerance is changed.
+
+[chonk-profiler-inventory-icb5a384016a9](chonk-profiler-inventory-icb5a384016a9/experiment.toml) reads bounded selected ROCm profiler file metadata and parser text on the baseline image without invoking a collector, importing vendor libraries or using GPUs.
+Its explicit three-minute `cscs` envelope and scoped absence observations establish neither global tool availability nor safe partial trace export, GPU correctness or fusion attribution.
+
+[chonk-profiler-sdk-inventory-icb5a384016a9](chonk-profiler-sdk-inventory-icb5a384016a9/experiment.toml) selects three literal packaged-SDK roots and eight explicit filenames per root instead of assuming installation under `/opt/rocm*`.
+It retains bounded parser/header/version metadata without invoking help/version commands, native tools, vendor imports or GPUs; source identity and parser options do not prove native attach/flush safety or trace correlation.
 
 [moe-mid4b-profile-m1072583a9632-icb5a384016a9](moe-mid4b-profile-m1072583a9632-icb5a384016a9/experiment.toml) adds only native PyTorch-profiler arguments to the compilation diagnostic.
 It profiles one update after step 10 on ranks 0/1 and 32/33, covering both pipeline stages and local-rank-0 versus local-rank-1 behavior.

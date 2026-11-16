@@ -1,0 +1,37 @@
+# Numerical component probe, not a complete MoE/training equivalence test.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+TORCH_COMPILE_DISABLE = "0"
+NCCL_P2P_DISABLE = "1"
+
+[procedure]
+kind = "commands"
+timeout = 600
+validation = "../validation/grouped_linear_probe.py"
+commands = [
+  ["python3", "-u", "-c", '''
+import os
+from pathlib import Path
+import runpy
+import sys
+import tempfile
+from apertus_amd.config import CACHE_PATHS
+
+# Each task owns its temporary compiler cache; no shared image/cache mutation.
+rank = os.environ["SLURM_PROCID"]
+prefix = "apertus-grouped-probe-" + os.environ["SLURM_JOB_ID"] + "-" + rank + "-"
+with tempfile.TemporaryDirectory(prefix=prefix, dir="/dev/shm") as directory:
+    for variable, relative in CACHE_PATHS.items():
+        path = Path(directory) / relative
+        path.mkdir()
+        os.environ[variable] = str(path)
+    sys.argv = ["/apertus/validation.py", "."]
+    runpy.run_path("/apertus/validation.py", run_name="__main__")
+'''],
+]

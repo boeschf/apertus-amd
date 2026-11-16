@@ -1,0 +1,14 @@
+# Metadata/files only: all four reserved GPUs remain unused.
+# Parent CLI must select --memory-gb 2 --time 00:05:00 --reservation cscs.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[procedure]
+kind = "commands"
+timeout = 120
+validation = "../validation/te_source_inventory.py"
+commands = [["python3", "-u", "/apertus/validation.py", ".",
+             "--max-hash-bytes", "1073741824", "--deadline-seconds", "110"]]

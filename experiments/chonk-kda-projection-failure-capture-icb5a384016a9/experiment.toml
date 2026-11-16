@@ -1,0 +1,24 @@
+# Capture-only diagnostic of failed740659; not numerical/performance acceptance.
+# Parent must select --time 00:05:00 --reservation cscs; no GPU authorization here.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+TORCH_COMPILE_DISABLE = "0"
+NCCL_P2P_DISABLE = "1"
+
+[procedure]
+kind = "commands"
+timeout = 200
+validation = "../validation/kda_projection_failure_capture.py"
+commands = [[
+  "python3", "-u", "/apertus/validation.py", "run", ".",
+  "--native-provenance", "pinned-image-build-provenance",
+  "--tokens", "4096", "--inputs", "3584", "--outputs", "11036",
+  "--phase-timeout", "120", "--rank-timeout", "180",
+  "--max-coordinates", "512", "--capture-bytes", "33554432",
+]]

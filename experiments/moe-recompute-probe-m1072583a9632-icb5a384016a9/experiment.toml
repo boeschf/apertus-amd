@@ -1,0 +1,57 @@
+# COMPONENT PROXY ONLY: one native MoELayer, NOT a full Chonk model/training run.
+# Four nodes / sixteen GPUs: EP16, TP/PP/CP/ETP1; two microbatches per mode.
+# num-layers=42 preserves Chonk's native output-weight initialization scale.
+# The validator constructs layer 4 only; pretrain_gpt.py is pinned but NOT executed.
+# Compare native moe vs moe_act; no optimizer, DDP reduction, reference kernels,
+# checkpoint files, beta-finalization, offload, or accumulation-fusion change.
+# save-interval only satisfies native validation of the launcher's appended --save;
+# the component validator never enters the training/checkpoint-save loop.
+nodes = 4
+entrypoint = "pretrain_gpt.py"
+prepare = [["make", "-C", "megatron/core/datasets"]]
+args = [
+  "--num-layers", "42", "--hidden-size", "3584", "--ffn-hidden-size", "17280",
+  "--num-attention-heads", "28", "--normalization", "RMSNorm",
+  "--disable-bias-linear", "--sssglu", "--seq-length", "4096", "--max-position-embeddings", "4096",
+  "--attention-dropout", "0", "--hidden-dropout", "0", "--init-method-std", "0.016703827619526525",
+  "--num-experts", "256", "--moe-router-topk", "8", "--moe-layer-freq", "1",
+  "--moe-ffn-hidden-size", "1920", "--moe-latent-size", "1792",
+  "--moe-shared-expert-intermediate-size", "1920", "--moe-grouped-gemm", "--moe-permute-fusion",
+  "--moe-token-dispatcher-type", "alltoall", "--moe-router-score-function", "sigmoid",
+  "--moe-router-dtype", "fp32", "--moe-router-topk-scaling-factor", "2.5",
+  "--moe-router-load-balancing-type", "quantile_balancing", "--moe-aux-loss-coeff", "0.0",
+  "--moe-router-quantile-balancing-method", "histogram", "--moe-router-quantile-balancing-ema", "0",
+  "--moe-router-quantile-balancing-num-bins", "1000", "--moe-router-violation-metrics", "mbs",
+  "--transformer-impl", "transformer_engine", "--tensor-model-parallel-size", "1",
+  "--pipeline-model-parallel-size", "1", "--context-parallel-size", "1",
+  "--expert-model-parallel-size", "16", "--expert-tensor-parallel-size", "1",
+  "--micro-batch-size", "1", "--global-batch-size", "32", "--bf16", "--main-grads-dtype", "fp32",
+  "--recompute-granularity", "selective", "--recompute-modules", "moe",
+  "--no-gradient-accumulation-fusion", "--no-overlap-p2p-communication",
+  "--train-iters", "1", "--save-interval", "1", "--seed", "42", "--mock-data", "--tokenizer-type", "NullTokenizer",
+  "--vocab-size", "200063", "--make-vocab-size-divisible-by", "128",
+  "--num-workers", "0", "--eval-iters", "0", "--distributed-timeout-minutes", "5",
+]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "1072583a9632fd1902544f7eaea562e2578ef1de"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[environment]
+NCCL_DEBUG = "INFO"
+NCCL_P2P_DISABLE = "1"
+NCCL_RUNTIME_CONNECT = "0"
+SS_BALLAST_GB = "0"
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+TORCH_COMPILE_DISABLE = "0"
+BEVERIN_COMM_WARMUP = "1"
+BEVERIN_COMM_WARMUP_PARTS = "ar,p2p,a2a"
+
+[procedure]
+kind = "train"
+validation = "../validation/moe_recompute_probe.py"

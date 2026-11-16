@@ -1,0 +1,21 @@
+# GPU component correctness only: no full-model gradients, training or performance acceptance.
+# Parent launch must specify --reservation cscs --time 00:30:00 and protected-node exclusions.
+nodes = 2
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "2"
+NCCL_P2P_DISABLE = "1"
+
+[procedure]
+kind = "commands"
+timeout = 660
+validation = "../validation/combined_image_components.py"
+commands = [
+  ["python3", "-u", "/apertus/validation.py", "aiter"],
+  ["python3", "-u", "/apertus/validation.py", "uccl"],
+]

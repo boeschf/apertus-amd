@@ -1,9 +1,11 @@
 """Exercise build-to-publication composition and retained failures using tool stubs."""
 
 import json
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -20,7 +22,9 @@ build = builder_module.build
 
 @pytest.mark.parametrize("export_status", [0, 23])
 @pytest.mark.parametrize("cleanup_status", [0, 17])
-def test_enroot_workaround_preserves_export_status(tmp_path, export_status, cleanup_status):
+@pytest.mark.parametrize("engine_status", [0, 19])
+def test_enroot_workaround_preserves_primary_failure_and_rejects_cleanup_failure(
+        tmp_path, export_status, cleanup_status, engine_status):
     library = tmp_path / "custom installation"
     library.mkdir()
     original = '''trap 'common::rmall "${tmpdir}" 2> /dev/null; docker rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT\n'''
@@ -37,15 +41,197 @@ def test_enroot_workaround_preserves_export_status(tmp_path, export_status, clea
 tmpdir=/unused/workspace
 engine=podman
 common::rmall() { return "$CLEANUP_STATUS"; }
-podman() { printf '%s\\n' "$*" > "$CALLS"; return "$CLEANUP_STATUS"; }
+podman() { printf '%s\\n' "$*" > "$CALLS"; return "$ENGINE_STATUS"; }
 source "$HELPER"
 exit "$EXPORT_STATUS"
 '''
     result = subprocess.run(["bash", "-c", script], env={**os.environ,
         "HELPER": str(Path(env["ENROOT_LIBRARY_PATH"]) / "docker.sh"), "CALLS": str(tmp_path / "calls"),
-        "CLEANUP_STATUS": str(cleanup_status), "EXPORT_STATUS": str(export_status)}, capture_output=True)
+        "CLEANUP_STATUS": str(cleanup_status), "ENGINE_STATUS": str(engine_status),
+        "EXPORT_STATUS": str(export_status)}, capture_output=True)
+    assert result.returncode == (export_status or cleanup_status or engine_status)
+    if export_status:
+        assert not (tmp_path / "calls").exists()
+    else:
+        assert (tmp_path / "calls").read_text().strip() == "rm -f -v workspace"
+
+
+@pytest.mark.parametrize("export_status", [0, 23])
+def test_deferred_enroot_trap_records_objects_without_cleanup(tmp_path, export_status):
+    library, evidence = tmp_path / "library", tmp_path / "evidence"
+    library.mkdir()
+    evidence.mkdir()
+    original = '''trap 'common::rmall "${tmpdir}" 2> /dev/null; docker rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT\n'''
+    (library / "docker.sh").write_text(original)
+    env = {"ENROOT_LIBRARY_PATH": str(library)}
+    builder_module.enroot_cleanup_workaround(env, evidence, defer_cleanup=True)
+    script = '''set -e
+tmpdir="/unused/path with spaces/workspace"
+engine=podman
+common::rmall() { printf 'unexpected cleanup' > "$CALLS"; return 17; }
+podman() { printf 'unexpected engine' > "$CALLS"; return 19; }
+source "$HELPER"
+exit "$EXPORT_STATUS"
+'''
+    result = subprocess.run(["bash", "-c", script], env={**os.environ, **env,
+        "HELPER": str(Path(env["ENROOT_LIBRARY_PATH"]) / "docker.sh"),
+        "CALLS": str(tmp_path / "calls"), "EXPORT_STATUS": str(export_status)}, capture_output=True)
     assert result.returncode == export_status
-    assert (tmp_path / "calls").read_text().strip() == "rm -f -v workspace"
+    assert not (tmp_path / "calls").exists()
+    fields = (evidence / "enroot-cleanup-request.nul").read_bytes().split(b"\0")
+    assert fields == [str(export_status).encode(), b"/unused/path with spaces/workspace", b"podman", b"workspace", b""]
+    assert (library / "docker.sh").read_text() == original
+
+
+@pytest.mark.parametrize("export_status", [0, 23])
+def test_deferred_trap_record_failure_never_becomes_success(tmp_path, export_status):
+    library, evidence = tmp_path / "library", tmp_path / "evidence"
+    library.mkdir()
+    evidence.mkdir()
+    (library / "docker.sh").write_text('''trap 'common::rmall "${tmpdir}" 2> /dev/null; docker rm -f -v "${tmpdir##*/}" > /dev/null 2>&1' EXIT\n''')
+    env = {"ENROOT_LIBRARY_PATH": str(library)}
+    builder_module.enroot_cleanup_workaround(env, evidence, defer_cleanup=True)
+    # An existing directory makes the trap's record write fail deterministically.
+    Path(env["APERTUS_ENROOT_CLEANUP_RECORD"]).mkdir()
+    result = subprocess.run(["bash", "-c", 'tmpdir=/unused/workspace; engine=podman; source "$HELPER"; exit "$EXPORT_STATUS"'],
+        env={**os.environ, **env, "HELPER": str(Path(env["ENROOT_LIBRARY_PATH"]) / "docker.sh"),
+             "EXPORT_STATUS": str(export_status)}, capture_output=True)
+    if export_status:
+        assert result.returncode == export_status
+    else:
+        assert result.returncode != 0
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("export_status", [0, 23])
+@pytest.mark.parametrize("cleanup_status", [0, 17])
+@pytest.mark.parametrize("engine_status", [0, 19])
+def test_audited_enroot_daemon_body_has_one_cleanup_owner(
+        tmp_path, deferred, export_status, cleanup_status, engine_status):
+    library, evidence, target = tmp_path / "library", tmp_path / "evidence", tmp_path / "enroot-fixture"
+    for directory in (library, evidence, target):
+        directory.mkdir()
+    original = (ROOT / "tests/fixtures/enroot-daemon-import.sh").read_text()
+    body = re.search(r'^docker::daemon::import\(\) \(\n.*?^\)$', original, re.MULTILINE | re.DOTALL).group()
+    assert hashlib.sha256(body.encode()).hexdigest() == builder_module.ENROOT_DAEMON_IMPORT_SHA256
+    (library / "docker.sh").write_text(original)
+    env = {"ENROOT_LIBRARY_PATH": str(library)}
+    record = builder_module.enroot_cleanup_workaround(env, evidence, defer_cleanup=deferred)
+    script = '''set -euo pipefail
+common::checkcmd() { :; }
+common::realpath() { printf '%s\\n' "$1"; }
+common::mktmpdir() { printf '%s\\n' "$TARGET"; }
+common::chdir() { cd "$1"; }
+common::log() { :; }
+common::fixperms() { :; }
+common::rmall() { printf 'workspace\\n' >> "$CLEANUPS"; return "$CLEANUP_STATUS"; }
+docker::daemon::_config_squash() { :; }
+tar() { cat > /dev/null; }
+podman() {
+    printf '%s\\n' "$*" >> "$CALLS"
+    case "$1" in
+      create) : > "$CONTAINER_STATE" ;;
+      export) return "$EXPORT_STATUS" ;;
+      rm) [ -f "$CONTAINER_STATE" ] || return 29
+          [ "$ENGINE_STATUS" = 0 ] || return "$ENGINE_STATUS"
+          command rm "$CONTAINER_STATE" ;;
+      *) return 31 ;;
+    esac
+}
+source "$HELPER"
+docker::daemon::import podman://abc "$IMAGE_OUTPUT" '' tar
+'''
+    result = subprocess.run(["bash", "-c", script], env={**os.environ, **env,
+        "HELPER": str(Path(env["ENROOT_LIBRARY_PATH"]) / "docker.sh"), "TARGET": str(target),
+        "IMAGE_OUTPUT": str(tmp_path / "image.sqsh"), "CALLS": str(tmp_path / "calls"),
+        "CLEANUPS": str(tmp_path / "cleanups"), "CONTAINER_STATE": str(tmp_path / "container-state"),
+        "EXPORT_STATUS": str(export_status), "CLEANUP_STATUS": str(cleanup_status),
+        "ENGINE_STATUS": str(engine_status)}, capture_output=True)
+    assert result.returncode == (export_status if deferred else export_status or cleanup_status or engine_status), result.stderr
+    calls = (tmp_path / "calls").read_text().splitlines()
+    if deferred or export_status:
+        assert not any(line.startswith('rm ') for line in calls)
+        assert not (tmp_path / "cleanups").exists()
+        assert (tmp_path / "container-state").exists()
+    else:
+        assert calls.count('rm -f -v enroot-fixture') == 1
+        assert (tmp_path / "cleanups").read_text() == 'workspace\n'
+    if deferred:
+        assert (evidence / "enroot-cleanup-request.nul").read_bytes().split(b'\0') == [
+            str(export_status).encode(), os.fsencode(target), b'podman', b'enroot-fixture', b'']
+    assert record['inline_container_cleanup'] == ('deferred' if deferred else 'moved-to-exit-trap')
+    assert (library / "docker.sh").read_text() == original
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_audited_enroot_cleanup_keeps_external_engine_cwd_until_removal(tmp_path, deferred):
+    library, evidence, target = tmp_path / "library", tmp_path / "evidence", tmp_path / "enroot-fixture"
+    for directory in (library, evidence, target):
+        directory.mkdir()
+    original = (ROOT / "tests/fixtures/enroot-daemon-import.sh").read_text()
+    (library / "docker.sh").write_text(original)
+    env = {"ENROOT_LIBRARY_PATH": str(library)}
+    builder_module.enroot_cleanup_workaround(env, evidence, defer_cleanup=deferred)
+    engine = tmp_path / "podman"
+    engine.write_text(f"#!{sys.executable}\n" + '''import os, sys
+with open(os.environ["CALLS"], "a") as stream:
+    try:
+        cwd = os.getcwd()
+    except FileNotFoundError:
+        stream.write(sys.argv[1] + " CWD_MISSING\\n")
+        sys.exit(41)
+    stream.write(sys.argv[1] + " " + cwd + "\\n")
+''')
+    engine.chmod(0o755)
+    # Execute the real generated daemon-import function and trap, not a hand-written
+    # replacement. Only our disposable test directory is removed by common::rmall.
+    script = '''set -euo pipefail
+common::checkcmd() { :; }
+common::realpath() { printf '%s\\n' "$1"; }
+common::mktmpdir() { printf '%s\\n' "$TARGET"; }
+common::chdir() { cd "$1"; }
+common::log() { :; }
+common::fixperms() { :; }
+common::rmall() { command rm -rf -- "$1"; }
+docker::daemon::_config_squash() { :; }
+tar() { cat > /dev/null; }
+source "$HELPER"
+docker::daemon::import podman://abc "$IMAGE_OUTPUT" '' tar
+'''
+    result = subprocess.run(["bash", "-c", script], env={**os.environ, **env,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "HELPER": str(Path(env["ENROOT_LIBRARY_PATH"]) / "docker.sh"), "TARGET": str(target),
+        "IMAGE_OUTPUT": str(tmp_path / "image.sqsh"), "CALLS": str(tmp_path / "calls")},
+        capture_output=True, text=True)
+    calls = (tmp_path / "calls").read_text().splitlines()
+    assert result.returncode == 0, (result.stderr, calls)
+    assert calls == [f"create {target}", f"export {target}"] + ([] if deferred else [f"rm {target}"])
+    assert target.exists() is deferred
+    if deferred:
+        assert (evidence / "enroot-cleanup-request.nul").read_bytes().split(b"\0") == [
+            b"0", os.fsencode(target), b"podman", b"enroot-fixture", b""]
+    assert (library / "docker.sh").read_text() == original
+
+
+@pytest.mark.parametrize("damage", ['create', 'remove', 'duplicate', 'extra-cleanup'])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_unaudited_enroot_daemon_protocol_is_not_partially_patched(tmp_path, damage, deferred):
+    library, evidence = tmp_path / "library", tmp_path / "evidence"
+    library.mkdir()
+    evidence.mkdir()
+    text = (ROOT / "tests/fixtures/enroot-daemon-import.sh").read_text()
+    if damage == 'create':
+        text = text.replace('create --name', 'create --other')
+    elif damage == 'remove':
+        text = text.replace('"${engine}" rm', '"${engine}"  rm')
+    elif damage == 'duplicate':
+        text += text
+    else:
+        text = text.replace('    # Cleanup the container', '    rm -rf unreviewed\n    # Cleanup the container')
+    (library / "docker.sh").write_text(text)
+    with pytest.raises(ValueError, match='unaudited Enroot'):
+        builder_module.enroot_cleanup_workaround({'ENROOT_LIBRARY_PATH': str(library)}, evidence, defer_cleanup=deferred)
+    assert not (evidence / 'enroot-library').exists()
 
 
 def test_enroot_workaround_discovers_prefix_and_leaves_unknown_helpers(tmp_path):
@@ -139,6 +325,11 @@ elif stage == 'export':
     assert workspace.is_dir()
     assert pathlib.Path(os.environ['ENROOT_LIBRARY_PATH']).name == 'enroot-library'
     assert 'exit "${status}"' in pathlib.Path(os.environ['ENROOT_LIBRARY_PATH'], 'docker.sh').read_text()
+    if os.environ.get('APERTUS_ENROOT_CLEANUP_RECORD'):
+        directory = workspace / 'enroot-fixture'
+        directory.mkdir()
+        pathlib.Path(os.environ['APERTUS_ENROOT_CLEANUP_RECORD']).write_bytes(
+            b'0\\0' + os.fsencode(directory) + b'\\0podman\\0enroot-fixture\\0')
     pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'hsqs fixture')
 else:
     assert pathlib.Path(args[-1]).read_bytes() == b'hsqs fixture'
@@ -200,6 +391,101 @@ def test_build_composes_with_unmodified_copied_publisher(builder, tmp_path):
     assert json.loads(Path(result["provenance"]).read_text()) == record
 
 
+def test_explicit_deferred_export_keeps_workspace_and_records_caller_handoff(builder, monkeypatch):
+    source, output, _ = builder
+    original = builder_module.shutil.rmtree
+
+    def refuse_export_cleanup(path, *args, **kwargs):
+        assert not Path(path).name.startswith("apertus-image-export-"), "deferred workspace was traversed"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(builder_module.shutil, "rmtree", refuse_export_cleanup)
+    built = build(source, output, ["app", "apertus-2", "megatron-primus268-rocm"], defer_export_cleanup=True)
+    handoff = json.loads(Path(built["deferred_cleanup"]).read_text())
+    assert Path(handoff["workspace"]).is_dir()
+    assert Path(handoff["enroot_directory"]).is_dir()
+    assert handoff["container_name"] == "enroot-fixture"
+    assert handoff["engine"] == "podman"
+    provenance = json.loads(Path(built["provenance"]).read_text())
+    assert provenance["validation"]["squashfs_full_read"] == "passed"
+    assert provenance["export_options"]["cleanup"] == "deferred"
+    assert provenance["export_options"]["enroot_cleanup"]["cleanup"] == "deferred"
+
+
+def test_copied_standalone_deferred_cli_needs_no_project_imports(builder, tmp_path):
+    source, output, _ = builder
+    script = tmp_path / "build.py"
+    shutil.copyfile(ROOT / "scripts/build.py", script)
+    result = subprocess.run([sys.executable, "-S", str(script), "--source", str(source),
+        "--output", str(output), "--defer-export-cleanup", "app", "apertus-2", "megatron-primus268-rocm"],
+        capture_output=True, text=True, check=True)
+    handoff = json.loads(Path(json.loads(result.stdout)["deferred_cleanup"]).read_text())
+    assert Path(handoff["workspace"]).is_dir()
+
+
+@pytest.mark.parametrize("blocked", [None, "build", "export", "full-read", "cleanup-export"])
+def test_external_phase_gate_prevents_unsafe_nested_operation_and_completion(builder, blocked):
+    source, output, _ = builder
+    gates = []
+
+    def gate(name):
+        gates.append(name)
+        if name == blocked:
+            raise ValueError("external health/capacity gate refused")
+
+    if blocked:
+        with pytest.raises(ValueError, match="external health/capacity"):
+            build(source, output, ["app", "apertus-2", "megatron-primus268-rocm"], phase_gate=gate)
+        assert not (output / "provenance.json").exists()
+        commands = json.loads((output / "evidence/commands.json").read_text())
+        assert blocked not in [row["name"] for row in commands]
+        if blocked in {"export", "full-read", "cleanup-export"}:
+            workspace = Path(json.loads((output / "evidence/export-workspace.json").read_text())["path"])
+            assert workspace.is_dir()
+    else:
+        result = build(source, output, ["app", "apertus-2", "megatron-primus268-rocm"], phase_gate=gate)
+        assert gates == ["generate", "render", "build", "inspect", "export", "full-read", "cleanup-export"]
+        assert json.loads(Path(result["provenance"]).read_text())["build_options"]["external_phase_gate"] is True
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "failure", "escape", "dotdot", "engine", "container", "oversized"])
+def test_deferred_request_rejects_ambiguous_or_unowned_objects(tmp_path, damage):
+    evidence, workspace = tmp_path / "evidence", tmp_path / "workspace"
+    evidence.mkdir()
+    directory = str(workspace / "container")
+    status, engine, container = "0", "podman", "container"
+    if damage == "failure":
+        status = "23"
+    elif damage == "escape":
+        directory = str(tmp_path / "elsewhere/container")
+    elif damage == "dotdot":
+        directory = str(workspace / "../container")
+    elif damage == "engine":
+        engine = "/unowned/podman"
+    elif damage == "container":
+        container = "other"
+    raw = b"\0".join(value.encode() for value in (status, directory, engine, container, ""))
+    if damage == "duplicate":
+        raw *= 2
+    elif damage == "oversized":
+        raw = b"x" * 65537
+    if damage != "missing":
+        (evidence / "enroot-cleanup-request.nul").write_bytes(raw)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        builder_module.deferred_cleanup_request(evidence, workspace, {"PATH": "/usr/bin:/bin"})
+    assert not (evidence / "deferred-cleanup.json").exists()
+
+
+def test_deferred_cleanup_requires_the_exact_known_enroot_trap(tmp_path):
+    library, evidence = tmp_path / "library", tmp_path / "evidence"
+    library.mkdir()
+    evidence.mkdir()
+    (library / "docker.sh").write_text("# different helper\n")
+    with pytest.raises(ValueError, match="unknown Enroot trap"):
+        builder_module.enroot_cleanup_workaround({"ENROOT_LIBRARY_PATH": str(library)}, evidence, defer_cleanup=True)
+    assert not (evidence / "enroot-library").exists()
+
+
 @pytest.mark.parametrize("stage", ["generate", "build", "inspect", "export", "full-read"])
 def test_failed_build_retains_evidence_without_publishable_provenance(builder, monkeypatch, stage):
     source, output, _ = builder
@@ -248,6 +534,17 @@ def test_combined_copied_tools_publish_and_clean_workspace(builder, combined_too
     assert (image.parent / "source.tar.gz").is_file()
     assert json.loads((image.parent / "manifest.json").read_text())["provenance"]["id"] == "fixture:alps7-dev-abc"
     assert not list(temporary.iterdir())
+
+
+def test_combined_wrapper_does_not_bypass_deferred_cleanup_ownership(builder, combined_tools, tmp_path):
+    source, _, _ = builder
+    scripts, temporary = combined_tools
+    command = combined_command(scripts, source, tmp_path / "store")
+    command.insert(3, "--defer-export-cleanup")
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert not list(temporary.iterdir())
+    assert not (tmp_path / "store").exists()
 
 
 def test_combined_build_failure_never_publishes(builder, combined_tools, tmp_path, monkeypatch):

@@ -1,0 +1,13 @@
+# Metadata only; all four allocated GPUs remain unused.
+# Parent must select --time 00:03:00 --reservation cscs and the reviewed transport.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "cb5a384016a99328a970d823ecf264a45e43b23b41e8e0c73e2baf14c33e77c0"
+
+[procedure]
+kind = "commands"
+timeout = 60
+validation = "../validation/profiler_inventory.py"
+commands = [["python3", "-u", "/apertus/validation.py", "."]]

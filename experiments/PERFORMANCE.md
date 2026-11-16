@@ -4,16 +4,19 @@
 
 Keep model geometry, optimizer, sequence length, global batch, parallel layout, source, image, and communication settings fixed within each comparison.
 Record every intentional change in an explicit experiment input.
-Change one optimization at a time, including its required source backport, and compare it against the preceding accepted configuration.
+Change one runtime optimization at a time, including its required source backport, and compare it against the preceding accepted configuration.
+The agreed UCCL upgrade and AITER image-cache seed share one candidate image build; their selected execution paths and component checks remain explicit.
+Build and make candidate images available only through this repository's `scripts/build.py` and `scripts/publish.py` tools (or their thin `build-publish.py` wrapper), retaining provenance and immutable published identities.
 Measure CPU affinity and allocated nodes because memory placement and host state can affect these MI300A runs.
+Retain restored startup-only affinity excursions as advisory observations; escalate persistent or unrestored bindings, changed thread defaults, or excursions during measured updates rather than automatically repeating completed runs.
 Use at least two unprofiled repetitions per configuration before accepting small speedups.
 Report seconds per update and tokens per second per GPU using global batch times sequence length divided by world size and update duration.
 Use the same measurement window in both runs: initially updates 11–26, retaining all earlier timings separately.
-Extend the run if compiler activity or timing drift persists into that window rather than dropping slow samples after seeing results.
+If compiler activity or timing drift persists into that window, retain all samples and review a symmetric duration/window extension before subsequent paired runs rather than dropping slow samples or automatically extending one arm.
 Report median, mean, and spread; keep startup, checkpoint saving, and cache publication times separate.
 Keep cold and warm-cache results separate, and record which cache classes were actually restored.
 Do not use profiled update times as throughput measurements.
-Collect short CPU/GPU traces on representative ranks from both pipeline stages once compilation has settled.
+Collect short CPU/GPU traces on representative ranks from every pipeline stage once compilation has settled.
 Use traces to distinguish optimizer cost, expert GEMMs, routing/permutation, attention, communication waits, and CPU launch gaps.
 Kernel-duration sums alone do not measure elapsed time when streams overlap.
 Record finite updates, numerical comparison, checkpoint integrity, and cache reuse as separate outcomes.
@@ -75,3 +78,81 @@ Validate alternate attention/KDA kernels against forward and gradient references
 Benchmark exact-shape GEMM tuning and semantics-preserving layout changes individually before considering changes to hidden size or head counts.
 Any architecture-changing comparison needs its own model definition and must not be presented as a speedup of the unchanged trained model.
 Retained source constraints and historical kernel evidence are in `artifacts/investigations/compilation-performance/KDA-ARCHITECTURE.md`.
+
+## Active execution plan (2026-11-12)
+
+The full KDA Chonk baseline and both profiles are complete; retained outcomes are in `artifacts/investigations/compilation-performance/FINAL-SUMMARY.md`.
+Current execution outcomes, frozen evidence and scoped acceptance/blockers are indexed in [performance investigation status](../artifacts/investigations/performance-next/STATUS.md); completed subtracks do not waive the remaining numerical, checkpoint or production gates below.
+Keep the newer Primus 26.8 stack used by image `cb5a384016a9`; do not add an older-Primus comparison or change vendor Torch for this phase.
+Existing measurements remain valid evidence and do not need repeating because node screening was absent.
+Keep source, image, resolved settings, node list, compiler/cache evidence, and numerical/checkpoint outcomes explicit for every new run.
+Do not commit or push changes on the user's behalf.
+
+### Parallel workstreams
+
+Current priorities are GEMM/backend tuning, native UCCL EP correctness/performance, and AITER kernel validation/performance as three parallel tracks, by user direction on 2026-11-14.
+For GEMM tuning, independently qualify each explicitly selected operation's numerical checks, shape/layout and backend consumer before tuning; a separately named forward-only component does not pass or waive the failed accumulated-wgrad/full-projection control.
+For UCCL EP, resolve the native output/gradient differences before accepting throughput results.
+For AITER, establish which kernels the baseline already consumes and a concrete candidate delta, then validate forward/backward at actual Chonk shapes before performance claims; the existing small attention check is not actual-shape acceptance.
+Keep grouped-GEMM tuning under the GEMM track to avoid duplicate or bundled experiments, and retain the existing published image/vendor stack unless a separately reviewed change requires rebuilding.
+Defer accumulation-fusion and collector work behind these three tracks; do not schedule another full-model fusion attempt without a separate decision and usable attribution.
+
+| Track | Image rebuild | Work | Dependencies and acceptance |
+| --- | --- | --- | --- |
+| Finalization tooling | No | Correct bounded check/publication coordination and peer-failure handling; test slow publication and cleanup failure paths | CPU lifecycle tests, then real-run finalization; preserve immutable caches and evidence |
+| Combined UCCL + AITER image | Yes, one shared candidate | Pin current upstream UCCL, discard superseded patches, retain justified fixes, and bake compatible AITER JIT seed modules using the vLLM pattern | Keep newer Primus base; component/import, dispatch/combine/gradient/lifetime and seed checks before full-model claims |
+| Image-seed hydration | No, consumes candidate image | Copy compatible baked AITER objects into private rank caches before merging compatible published objects | Record seed provenance and reuse; do not copy binaries blindly from a different vLLM image |
+| Accumulation fusion | No if selected backend supports it | Enable only gradient-accumulation fusion; inspect AccumulateGrad stream mismatch and actual expert/dense/LM-head paths | Forward and accumulated-gradient checks, memory and repeated unprofiled timing; standalone-add removal alone is insufficient |
+| Narrower recomputation | No | Replace only `moe` with `moe_act`, keeping `layernorm linear_attn` | Validate outputs/gradients, increased retained activation memory, and repeated timing |
+| PR #73 P2P restoration | Initially no | Test the complete relevant runtime settings with RCCL P2P explicitly enabled | Goal: correct stable full-model training without needing `NCCL_P2P_DISABLE=1`, including memory and teardown |
+| GEMM/backend tuning | Usually no | Collect exact forward/dgrad/wgrad shapes and strides; tune hipBLASLt, grouped experts and applicable AITER kernels | Separate JIT reuse from faster kernel selection; rebuild only for demonstrated backend/tool requirements |
+| AITER attention and non-GEMM kernels | Not initially | Establish installed TE/flash-attention/AITER consumers and a distinct candidate beyond baseline kernels; validate actual Chonk attention and any supported norm/pointwise/KDA replacement | Preserve forward/backward numerical gates; resolve full-shape GQA reference and BF16-control equivalence before implementation; static source inventory does not establish runtime dispatch |
+| Reference/log audit | No | Retain NVIDIA reference configurations; classify stream/communicator, fallback, precision and logging warnings | Historical numbers are targets, not a matched current-Chonk comparison |
+| Non-blocking node survey | No | Read buddyinfo, page size, NUMA memory, uptime and scheduler availability periodically | Timestamp/rank by worst GPU-local NUMA domain; informational only, not a submission gate |
+
+Image preparation/builds, tooling/CPU tests, current-image GPU experiments, and the reference/node audits can proceed concurrently.
+For UCCL, review the intervening commits from the old pin to the candidate pin, not just patch applicability or current-source similarity.
+Classify each retained correction as essential, redundant, potentially harmful or unproven, with upstream commit/PR evidence and required compiler/runtime checks.
+Distinguish requirements of our selected full-node execution path from unused compatibility fixes, and do not select the candidate for training acceptance until this review and relevant checks pass.
+Keep running build contexts frozen; corrections require a separately retained build attempt through the same build/publish tools.
+During execution, provide approximately five-minute progress updates grouped by these workstreams and report failures or blockers sooner.
+Updates distinguish submitted/running work, measured GPU outcomes, CPU-only checks, image build/publication status and remaining dependencies.
+Run independent GPU tests only in disjoint authorized allocations under reservation `cscs`; do not borrow or disturb unrelated interactive jobs.
+Reuse a node set for paired small-gain measurements when practical, without delaying work for ideal nodes.
+Do not run intrusive allocation-based memory probes or unrelated GPU tuning on benchmark nodes concurrently with training.
+Refresh lightweight node observations before runs and periodically when scheduler access permits, but do not require a clean-node threshold or retroactive reruns.
+Buddyinfo is a fragmentation indicator, not proof of GPU huge-page allocation capacity or the cause of the observed approximately 2.7% variation.
+
+### PR #73 acceptance and test order
+
+The objective is removal of the P2P-disable workaround, not merely checking that environment variables can be exported.
+Audit the settings against pinned RCCL/aws-ofi/libfabric implementations, then test the complete relevant set with `NCCL_P2P_DISABLE=0` to override any inherited disable.
+The candidate set from <https://github.com/eth-cscs/alps-extended-images/pull/73> is:
+
+```text
+OFI_NCCL_PROTOCOL=SENDRECV
+NCCL_CROSS_NIC=0
+NCCL_PXN_DISABLE=1
+NCCL_NET_GDR_LEVEL=PHB
+NCCL_NET_FORCE_FLUSH=1
+HSA_ENABLE_IPC_MODE_LEGACY=1
+NCCL_P2P_LEVEL=SYS
+OMPI_MCA_memory=^patcher
+```
+
+Preserve existing explicit CXI settings and disable both host network-injection hooks in every EDF.
+First check intra-/inter-node collective correctness and repeated communication/teardown, then full KDA Chonk on 16 nodes with progress and memory telemetry.
+Successful initialization alone does not resolve the earlier P2P-enabled memory-pressure stall.
+Compare against retained P2P-disabled measurements, adding a matched control only as required for a specific comparison rather than rerunning the whole baseline campaign.
+Use individual flag ablations to diagnose a failure or simplify a working configuration, not as a prerequisite to trying the complete set.
+Keep P2P disabled in the independent fusion/recomputation comparisons until the restoration experiment passes.
+Promote validated settings into image defaults later; unsupported settings require a targeted stack change, not a silent no-op success claim.
+UCCL's direct CXI path must be validated independently rather than assuming it consumes aws-ofi/RCCL settings.
+
+### Follow-on integration
+
+After independent trials, combine accepted fusion, recomputation, tuning and network changes with explicit inputs.
+Test the new UCCL dispatcher against ordinary all-to-all separately from simply installing the upgraded library.
+Investigate pipeline stage balance, supported communication overlap and the source-derived projection-padding hypothesis after attribution and numerical checks.
+Retain full-model checkpoint inventory, tensor-integrity/restart validation, production-checkpoint compatibility and forward/gradient equivalence as distinct goals.
+Finite mock-data training and successful cache reuse do not establish convergence, restart equivalence or production readiness.
