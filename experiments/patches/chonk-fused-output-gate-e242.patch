@@ -1,0 +1,99 @@
+Subject: [PATCH] Isolate default-off BF16 output gate on e242
+Base-commit: e242f3c3c1136aeae498529bfde5e06bda9a7cca
+
+Adapted from Imanol Schlag's b3-0005-fused-out-gate.patch.
+Repair the helper destination and restrict admission; preserve kernel arithmetic.
+Compare against the unchanged compiled baseline; no speedup is established.
+
+diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -1409,7 +1409,24 @@
+         # Output gate
+         if gate is not None:
+             nvtx_range_push(suffix="output_gate")
+-            core_attn_out = self._apply_output_gate(core_attn_out, gate)
++            import os as _os
++
++            if (
++                _os.environ.get("BEVERIN_FUSED_OUT_GATE", "0") == "1"
++                and type(core_attn_out) is torch.Tensor
++                and type(gate) is torch.Tensor
++                and core_attn_out.is_cuda and gate.is_cuda
++                and core_attn_out.dtype == gate.dtype == torch.bfloat16
++                and core_attn_out.device == gate.device
++                and core_attn_out.layout == gate.layout == torch.strided
++                and not core_attn_out.is_nested and not gate.is_nested
++                and core_attn_out.numel() == gate.numel() > 0
++            ):
++                from megatron.core.extensions.beverin_gate import sigmoid_gate
++
++                core_attn_out = sigmoid_gate(core_attn_out, gate)
++            else:
++                core_attn_out = self._apply_output_gate(core_attn_out, gate)
+             nvtx_range_pop(suffix="output_gate")
+ 
+         # release after output gate
+diff --git a/megatron/core/extensions/beverin_gate.py b/megatron/core/extensions/beverin_gate.py
+new file mode 100644
+--- /dev/null
++++ b/megatron/core/extensions/beverin_gate.py
+@@ -0,0 +1,58 @@
++# Adapted from Imanol Schlag's b3-0005-fused-out-gate.patch.
++# Default-off BF16 output gate; caller validates ordinary equal-sized CUDA tensors.
++# FP32 sigmoid/multiply and original BF16 stores; no compiled-baseline gain claimed.
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _gate_fwd(x_ptr, g_ptr, y_ptr, N, BLOCK: tl.constexpr):
++    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
++    m = i < N
++    x = tl.load(x_ptr + i, mask=m, other=0.0).to(tl.float32)
++    g = tl.load(g_ptr + i, mask=m, other=0.0).to(tl.float32)
++    tl.store(y_ptr + i, (x * tl.sigmoid(g)).to(y_ptr.dtype.element_ty), mask=m)
++
++
++@triton.jit
++def _gate_bwd(x_ptr, g_ptr, dy_ptr, dx_ptr, dg_ptr, N, BLOCK: tl.constexpr):
++    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
++    m = i < N
++    x = tl.load(x_ptr + i, mask=m, other=0.0).to(tl.float32)
++    g = tl.load(g_ptr + i, mask=m, other=0.0).to(tl.float32)
++    dy = tl.load(dy_ptr + i, mask=m, other=0.0).to(tl.float32)
++    s = tl.sigmoid(g)
++    tl.store(dx_ptr + i, (dy * s).to(dx_ptr.dtype.element_ty), mask=m)
++    tl.store(dg_ptr + i, (dy * x * s * (1.0 - s)).to(dg_ptr.dtype.element_ty), mask=m)
++
++
++_BLOCK = 4096
++
++
++class _SigmoidGate(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, gate):
++        x = x.contiguous()
++        g = gate.contiguous().view(x.shape)
++        y = torch.empty_like(x)
++        n = x.numel()
++        _gate_fwd[(triton.cdiv(n, _BLOCK),)](x, g, y, n, BLOCK=_BLOCK, num_warps=8)
++        ctx.save_for_backward(x, g)
++        ctx.gshape = gate.shape
++        return y
++
++    @staticmethod
++    def backward(ctx, dy):
++        x, g = ctx.saved_tensors
++        dy = dy.contiguous()
++        dx = torch.empty_like(x)
++        dg = torch.empty_like(g)
++        n = x.numel()
++        _gate_bwd[(triton.cdiv(n, _BLOCK),)](x, g, dy, dx, dg, n, BLOCK=_BLOCK, num_warps=8)
++        return dx, dg.view(ctx.gshape)
++
++
++def sigmoid_gate(x, gate):
++    """x * sigmoid(gate) (computed in fp32, returned in x.dtype); gate has x's numel."""
++    return _SigmoidGate.apply(x, gate)

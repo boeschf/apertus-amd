@@ -1,0 +1,27 @@
+# Explicit CXI repeat of the upstream suite; original assertions and inputs unchanged.
+# Use fresh exclusive nodes under cscs with the same 30-minute allocation cap.
+nodes = 2
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "2"
+NCCL_P2P_DISABLE = "0"
+UCCL_EP_TRANSPORT = "cxi"
+UCCL_SOCKET_IFNAME = "hsn"
+UCCL_CXI_THREADING = "safe"
+APERTUS_UCCL_TEST_SOURCE_SHA256 = "65d34247bf121c6a4374f3e8939313a7a4bf4a29e8c4e883be99f91aee34ae19"
+
+[procedure]
+kind = "commands"
+timeout = 360
+validation = "../validation/uccl_library_ep_tests.py"
+commands = [
+  ["python3", "-u", "/apertus/validation.py", "intranode"],
+  ["python3", "-u", "/apertus/validation.py", "internode"],
+  ["python3", "-u", "/apertus/validation.py", "low_latency"],
+  ["python3", "-u", "/apertus/validation.py", "dual_mode"],
+]

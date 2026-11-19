@@ -1,0 +1,17 @@
+# PREPARATION ONLY: proposed numerical policy and separate resource approval pending.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "2"
+TORCH_COMPILE_DISABLE = "0"
+
+[procedure]
+kind = "commands"
+timeout = 720
+validation = "../validation/chonk_output_gate_probe.py"
+commands = [["python3", "-u", "/apertus/validation.py", "run"]]

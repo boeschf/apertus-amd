@@ -1,0 +1,17 @@
+# Source/CPU reviewed; separate one-shot frozen-input/placement approval is required.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "2"
+TORCH_COMPILE_DISABLE = "0"
+
+[procedure]
+kind = "commands"
+timeout = 510
+validation = "../validation/chonk_sssglu_qualification.py"
+commands = [["python3", "-u", "/apertus/validation.py", "run"]]

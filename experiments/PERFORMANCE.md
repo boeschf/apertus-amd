@@ -36,6 +36,10 @@ Reference results and extracted evidence belong in `artifacts/investigations/com
 Initial differences to measure include gradient-reduction overlap and gradient-accumulation fusion, before stacking custom kernels.
 Subsequent candidates include Turbo grouped GEMM and fused weight gradients, SSSGLU kernels, tuned GEMM tiles, routing/CE/norm fusions, attention/KDA kernels, expert communication, and side-stream scheduling.
 Dependencies between patches must be recorded; an environment variable with no consumer in the selected source is not an enabled optimization.
+The user-supplied Chonk patch directory is `/iopsstor/scratch/cscs/boeschf/amd-vs-gh200-moe-training/chonk/patches/`.
+Audit patches individually against the selected source and installed vendor APIs; a clean apply-check does not verify helper destinations, numerical behavior or dependencies.
+Prefer an existing supported backend selector over importing a custom autograd/backend bundle when it isolates the same hypothesis.
+Keep compatibility fixes separate from performance arms, retain default-off source backports and require immutable base-plus-patch provenance before execution.
 Keep compiler policy fixed while testing each optimization, then revisit compilation if a custom kernel replaces a compiled path.
 FP8 dispatch, changed recomputation, and alternate attention kernels need numerical checks appropriate to the change.
 Historical tuning tables from Torch 2.10/Triton 3.6 must not be assumed valid on our Torch 2.14/Triton 3.8 image.
@@ -79,10 +83,11 @@ Benchmark exact-shape GEMM tuning and semantics-preserving layout changes indivi
 Any architecture-changing comparison needs its own model definition and must not be presented as a speedup of the unchanged trained model.
 Retained source constraints and historical kernel evidence are in `artifacts/investigations/compilation-performance/KDA-ARCHITECTURE.md`.
 
-## Active execution plan (2026-11-12)
+## Active execution plan
 
 The full KDA Chonk baseline and both profiles are complete; retained outcomes are in `artifacts/investigations/compilation-performance/FINAL-SUMMARY.md`.
 Current execution outcomes, frozen evidence and scoped acceptance/blockers are indexed in [performance investigation status](../artifacts/investigations/performance-next/STATUS.md); completed subtracks do not waive the remaining numerical, checkpoint or production gates below.
+The [next execution wave](#next-execution-wave-2026-11-19) updates the original roadmap using the completed component tests and Imanol patch audit.
 Keep the newer Primus 26.8 stack used by image `cb5a384016a9`; do not add an older-Primus comparison or change vendor Torch for this phase.
 Existing measurements remain valid evidence and do not need repeating because node screening was absent.
 Keep source, image, resolved settings, node list, compiler/cache evidence, and numerical/checkpoint outcomes explicit for every new run.
@@ -92,7 +97,9 @@ Do not commit or push changes on the user's behalf.
 
 Current priorities are GEMM/backend tuning, native UCCL EP correctness/performance, and AITER kernel validation/performance as three parallel tracks, by user direction on 2026-11-14.
 For GEMM tuning, independently qualify each explicitly selected operation's numerical checks, shape/layout and backend consumer before tuning; a separately named forward-only component does not pass or waive the failed accumulated-wgrad/full-projection control.
-For UCCL EP, resolve the native output/gradient differences before accepting throughput results.
+For UCCL EP, the user cleared the existing numerical-difference blocker on2026-11-19 after the unchanged upstream EP suite passed with explicit CXI in754226.
+Treat those observed differences as acceptable for continuing the performance investigation; retain the original failed comparisons without requiring contributor capture or tolerance calibration as prerequisites.
+This is an explicit acceptance decision, not a proved BF16 rounding bound or a claim that the original comparisons passed; matched performance, finite training, checkpoint and lifecycle checks remain separate.
 For AITER, establish which kernels the baseline already consumes and a concrete candidate delta, then validate forward/backward at actual Chonk shapes before performance claims; the existing small attention check is not actual-shape acceptance.
 Keep grouped-GEMM tuning under the GEMM track to avoid duplicate or bundled experiments, and retain the existing published image/vendor stack unless a separately reviewed change requires rebuilding.
 Defer accumulation-fusion and collector work behind these three tracks; do not schedule another full-model fusion attempt without a separate decision and usable attribution.
@@ -115,9 +122,31 @@ For UCCL, review the intervening commits from the old pin to the candidate pin, 
 Classify each retained correction as essential, redundant, potentially harmful or unproven, with upstream commit/PR evidence and required compiler/runtime checks.
 Distinguish requirements of our selected full-node execution path from unused compatibility fixes, and do not select the candidate for training acceptance until this review and relevant checks pass.
 Keep running build contexts frozen; corrections require a separately retained build attempt through the same build/publish tools.
+
+### Promotion of confirmed optimizations into images
+
+By user direction, relevant patches, tuning artifacts and supported settings with demonstrated correctness and positive performance effects should eventually become reproducible image contents rather than ad-hoc run modifications.
+Qualifying an API, kernel or baseline is not itself a positive performance result; failed, neutral and unmeasured optimization candidates are not promotion-ready.
+Required compatibility fixes may accompany a confirmed winner as explicitly tested dependencies, without being credited as independent speedups.
+Establish the effect with fixed-source/image/model/compiler/settings comparisons changing one optimization at a time, retaining numerical, memory, checkpoint and lifecycle gates appropriate to the change.
+Keep each candidate's correctness, measured effect and image-promotion status separate in run artifacts.
+
+Implement accepted image changes in the separate image-recipe repository, pinning upstream base/source revisions, patch bytes/order, tuning data, build inputs and supporting run evidence.
+For tuning tables or JIT seeds, record the actual consuming API and effective selection, hardware/shape/layout scope, library/compiler versions and artifact hashes; capture only quiescent validated objects and preserve safe behavior outside the qualified scope.
+Keep workload-specific settings and intended training arguments explicit in experiments unless broader image-default behavior has also been qualified.
+Megatron backports must retain an explicit matching source/base-plus-patch identity even when their assets are shipped in an image; do not silently execute a different checkout or replace vendor Torch.
+Keep Primus26.8 and the selected vendor Torch/TE/Triton versions unless a separate supported stack change is explicitly reviewed.
+
+Build and publish a new immutable candidate through the normal image tools, independently of experiment execution.
+Requalify imports, effective patch/tuning consumption, numerics, memory/lifecycle behavior and retained performance on that rebuilt image before promoting it as a default.
+Packaging several individually confirmed winners later does not make their combined interaction or performance established; retain an unchanged image/control and qualify the combined candidate separately.
+
+### Execution updates and placement
+
 During execution, provide approximately five-minute progress updates grouped by these workstreams and report failures or blockers sooner.
 Updates distinguish submitted/running work, measured GPU outcomes, CPU-only checks, image build/publication status and remaining dependencies.
-Run independent GPU tests only in disjoint authorized allocations under reservation `cscs`; do not borrow or disturb unrelated interactive jobs.
+Use disjoint exclusive allocations for independent GPU tests; do not borrow or disturb unrelated jobs.
+The `cscs` reservation and general `mi300` may run concurrently, with at most 16 investigation nodes in each pool.
 Reuse a node set for paired small-gain measurements when practical, without delaying work for ideal nodes.
 Do not run intrusive allocation-based memory probes or unrelated GPU tuning on benchmark nodes concurrently with training.
 Refresh lightweight node observations before runs and periodically when scheduler access permits, but do not require a clean-node threshold or retroactive reruns.
@@ -156,3 +185,159 @@ Test the new UCCL dispatcher against ordinary all-to-all separately from simply 
 Investigate pipeline stage balance, supported communication overlap and the source-derived projection-padding hypothesis after attribution and numerical checks.
 Retain full-model checkpoint inventory, tensor-integrity/restart validation, production-checkpoint compatibility and forward/gradient equivalence as distinct goals.
 Finite mock-data training and successful cache reuse do not establish convergence, restart equivalence or production readiness.
+
+## Next execution wave (2026-11-19)
+
+### Objective and current decisions
+
+Measure native UCCL in full KDA Chonk while independent teams prepare the next small GEMM and kernel changes from Imanol's patches.
+Do not bulk-apply the 60-patch directory or restart the baseline campaign.
+Use Megatron e242 and image 910 with Primus 26.8 and the unchanged vendor Torch/TE/Triton stack.
+Keep the accepted routing fix in both arms of each new comparison.
+The user has accepted the observed UCCL numerical differences after 754226 passed upstream intra-node, inter-node, low-latency and dual-buffer tests.
+Contributor capture and tolerance calibration are no longer prerequisites for that performance track.
+Retain original failed comparisons and their thresholds; do not relabel them as passing tests.
+The output-gate candidate and existing TE grouped-Triton selector have valid negative or nonqualifying timing results and remain parked.
+SSSGLU has useful numerical evidence but is not compiler-qualified.
+
+### Parallel ownership and dependencies
+
+Parallel work is enabled for the following independent responsibilities.
+Each owner keeps its own proposal, tests and artifacts; the coordinator owns shared plan changes, source-runner changes and final launch approval.
+This plan does not itself submit GPU jobs or grant unlimited allocations or retries.
+
+| Owner / track | Work that can start now | Next concrete deliverable | Dependency before GPU execution |
+| --- | --- | --- | --- |
+| A: UCCL training | Prepare a matched all-to-all/UCCL pair from committed e242; verify EP16 integration and effective transport/config consumers. | Two explicit 16-node/64-GPU inputs, source/image/settings diff, acceptance policy and bounded timing schedule. | Frozen inputs, production EP16 buffer/config review and fresh exclusive placement; no dependency on optional contributor capture. |
+| B: GEMM | Review custom Turbo API/storage and specify a narrow forward-only component; keep 0010 forward/dgrad as a secondary alternative. | One exact backend/shape/layout/storage contract, with no custom wgrad or implicit tuning activation. | CPU/source checks, then a separately approved small component allocation; no dependency on UCCL timing. |
+| C1: SSSGLU | Diagnose weighted-reference compiler specialization without changing the activation patch initially. | Specialization ledger, source-supported cause and corrected qualification proposal. | Default compiler-budget qualification before timing; retain all declared numerical and fallback checks. |
+| C2: Q/K norm | Prepare b3-0004 independently of C1 and the negative output gate. | Installed FLA training contract, parameter/state map and default-off numerical proposal. | Full shape/layout/output/input-gradient/parameter-gradient checks and parameter/checkpoint compatibility. |
+| C3: KDA layout | Inventory remaining copies and design a K2 convolution-only candidate separately from G2 padding. | Baseline/candidate copy ledger, exact shape/cast contract and backward cases. | Source/CPU review, then separate native qualification; no dependence on an SSSGLU retry. |
+| D: source execution support | Specify and test immutable base-plus-patch execution without commits or live-checkout imports. | Minimal source-selection extension and CPU failure-path tests, with unchanged commit-only behavior. | Independent review before any patched full-model run; not a prerequisite for committed-source UCCL. |
+| E: pipeline communication | Review the existing overlap consumer and isolate the even-PP communicator-split hypothesis. | Consumer/endpoint/lifetime map and a default-off PP4/VPP2 test proposal. | Separate schedule correctness and completion checks; no bundled EP/backend or wait-removal changes. |
+
+Use parallel CPU preparation freely within these ownership boundaries.
+Use `cscs` for ready component jobs while full-model training uses general `mi300`, within the separate 16-node limits.
+Keep the two matched training arms sequential and never share benchmark GPUs, private caches or mutable source trees between tracks.
+If nodes or review capacity are limited, prioritize UCCL training, then the first qualified GEMM or activation component.
+The coordinator reports progress about every five minutes during execution and reports blockers sooner.
+
+### A: native UCCL training and timing
+
+1. Prepare both arms from the same e242 source and image 910, with TP1/PP4/VPP2/EP16, sequence 4096, micro-batch 1 and global batch 512.
+   Select the accepted `moe_act` recompute policy for both arms, retaining `layernorm` and `linear_attn` recompute; validate the input against current source support and memory requirements before launch.
+   This pair compares dispatchers, not the old moe versus moe_act policy or different images.
+2. Set the control to ordinary all-to-all and the candidate to the installed native UCCL-backed flex path, with all required selectors explicit.
+   Keep P2P policy, compiler settings, optimizer, offload, warmup, model geometry and logging fixed in both arms.
+   Require `UCCL_EP_TRANSPORT=cxi`, `UCCL_SOCKET_IFNAME=hsn` and `UCCL_CXI_THREADING=safe` where the native path consumes them.
+   Do not add `FI_CXI_ENABLE_WRITEDATA`; 754226 passed without it.
+3. Review the production EP16 buffer capacities and dispatch/combine configuration independently of the earlier EP8 proxy.
+   Do not copy the EP8 combine tuple into EP16 without the installed API and capacity checks.
+   Verify the effective dispatcher, native library, local GPU selection and actual CXI initialization in run evidence.
+4. Use the first candidate run as both an integration check and the first timing sample.
+   Fail on nonfinite updates, wrong dispatch/import identity, lifecycle failure or a stated memory/time cap; the accepted historical numerical differences alone are not a failure trigger.
+   Do not attach contributor observers or intrusive profiling to timed runs.
+5. Target 60 updates per timing run and retain both preselected windows 11–26 and 45–60.
+   A1/B1 completed; the user deferred B2/A2 confirmation, so do not submit those jobs for now.
+   Record actual cache restoration and separate warm from cold evidence; dispatcher-specific JIT objects are not interchangeable by assumption.
+   Set explicit wall limits and review rules before submission; never extend one slow arm or drop slow samples after seeing its timings.
+6. Report update-time median/mean/spread, tokens/s/GPU, allocated memory, compilation, checkpoint time and finalization separately.
+   Use a same-image matched control where needed; the historical best window is context, not a substitute for this control.
+   No speedup is accepted from one favorable run or from a library microbenchmark.
+
+### B: Imanol GEMM candidates
+
+The existing TE grouped-Triton selector was the first low-risk test of Imanol's grouped-GEMM idea; 745752 showed it slower in every measured case.
+This does not prove that every custom Turbo kernel is slower, but it removes that selector from immediate promotion.
+The first design choice is a distinct custom Turbo implementation, not another run of the same TE flag.
+Review `0002-turbo-grouped-gemm-experts` and extract only the backend-selection intent from `0004-turbo-gg-backend-select`.
+Historical helpers target older private APIs; establish the installed Primus-Turbo 0.5.1.dev7 contract rather than assuming 0.2.0 compatibility.
+Do not port the broad origami-exception monkeypatch or hide a failed requested backend behind a silent fallback.
+Prove common storage, offsets and bounds for any stacked-weight view; pointer adjacency alone is not ownership proof.
+If zero-copy storage cannot be proved, use an explicit copied-weight control and include that cost, or stop that design.
+Keep grouped FC1/FC2, dense/latent projections and the vocabulary projection separate in the candidate ranking.
+Use actual Chonk dimensions, ragged and empty expert groups, current strides and BF16 inputs with the correct output/gradient dtypes.
+Start with a separately named forward-only component, not the complete 0002 custom training-autograd integration.
+Keep a narrow forward/dgrad subset of `0010-t4-te-lmhead-wgrad` as a separate secondary candidate; identify the actual selected module because its class-wide route is not automatically LM-head-only.
+Keep original wgrad, FP32 accumulation, DDP hooks and optimizer ordering unchanged in the first candidate.
+Treat the TE workspace patch as compatibility only and apply it equally to both arms if it is required.
+Before GPU tuning, identify the actual consumer for any solution table or kernel setting on this pinned image; do not reuse Torch 2.10/Triton 3.6 tables or assume Torch TunableOp controls TE's native path.
+After component correctness, time both device events and synchronized completion, including required packing/copies and realistic expert imbalance.
+Advance only a repeatable positive result that can affect elapsed training time; faster host return alone is insufficient.
+The accumulated-wgrad/full-projection failures remain separate blockers for any future fused-wgrad candidate.
+Prepare a bounded metadata observer at the existing host split boundary in parallel, without another device-to-host conversion, synchronization or tensor retention.
+If separately approved for a suitable non-timing or already instrumented production run, record 16 local experts, zero-inclusive splits, FC1/FC2 strides, post-SSSGLU layout, stage/VPP/microbatch and recompute context.
+Do not launch training just to collect those shapes or silently add the observer to timed UCCL arms; keep uncaptured cases labelled synthetic.
+
+### C: Imanol activation, norm and KDA candidates
+
+For 0007 SSSGLU, first determine why the weighted compiled reference exhausted the default `recompile_limit(8)` in 746139.
+Use retained guard logs to separate intended shape/dtype variants from an avoidable specialization or harness-state problem.
+The warning names the compiled baseline `weighted_sssglu` with weights expected BF16/actual FP32; it does not by itself prove a Triton-kernel defect.
+Include the final `prob_bf16` fallback and the baseline/default-off/candidate module contexts in the ledger.
+Preserve BF16 activations, FP32 probability-gradient semantics, both input-gradient halves, all declared cases and the default compiler policy.
+A corrected proposal must prove each production-like compiled signature stays within budget; it must not merely hide warnings, reset caches, raise limits or omit failing coverage.
+Auxiliary-worker isolation may be reviewed as a test protocol, but it cannot substitute for a representative mixed-call sequence within the default production compiler budget.
+Only then repeat bounded native qualification, followed by copy-inclusive paired timing of plain and weighted D1920 cases.
+The 376 passing numerical metrics are supporting evidence, not a reason to bypass this compiler check.
+Require complete supervisor/rank closure in the replacement proposal; retained rank 0/1 closure was incomplete after 746139 fail-fast.
+
+Prepare b3-0004-qknorm-fla independently while the SSSGLU investigation runs.
+Verify the exact helper path and installed API; map Q28/KV7/head128 layouts, normalization epsilon, learned parameters, optimizer grouping, state-dict keys and all parameter/input gradients.
+The historical helper replaces `q_layernorm`/`k_layernorm` with `fla.modules.RMSNorm` and copies parameter values; preserve original parameter identity and framework metadata where possible, rather than treating equal initial values as optimizer/checkpoint compatibility.
+Use actual Q/K row populations 114688×128 and 28672×128, with output, dinput and 128-element dgamma checks under a separate norm-specific numerical policy.
+Keep unsupported-input fallback and default-off selection; apply only the narrow candidate to an owned e242 export.
+The b3-0005 output gate remains parked because 745621 did not establish a positive effect, especially for strided inputs.
+Do not gate Q/K norm preparation on rerunning that negative candidate.
+
+Keep b3-0002 direct AITER attention as a consumer-difference question first: the baseline already executes AITER attention kernels.
+Do not count a different Python entry point or prebuilt cache seed as a new faster kernel.
+Prefer a K2 convolution-only design over importing the G2 padding bundle.
+Retain `norm_qk=False`, projection width 11036, parameters and checkpoint shapes; cover projected `[4096,1,11036]`, convolution weights `[10752,1,4]`, Q/K/V `[1,4096,3584]` and tail 284.
+Check projected-input and weight gradients, missing-output/tail-only gradients, causal/document boundaries and original cast points, not just forward outputs.
+Keep G2 padding as a separate later candidate, ranked against measured critical-path cost and exact stride requirements.
+Padding 11036 to 11040 must preserve beta28 slicing, outputs, backward and checkpoint parameter mapping; it is not a model-width change or an automatic fix.
+Do not combine KDA padding, recompute removal, tile changes and convolution fusion into one trial.
+The b3-0003 internal KDA recompute option is a separate memory/performance alternative; it does not remove outer `linear_attn` checkpointing and needs installed-API and saved-state memory review.
+Do not port k6 chunked-convolution private APIs in this wave.
+
+### D: immutable patch execution
+
+The current source runner freezes commits only, so staged patch files are not yet an executable full-model patch stack.
+Add only the concrete support needed to select an exact base commit plus explicit ordered patch assets and verify the resulting archive/file manifest.
+Keep preparation in an owned export; preserve external repositories and prohibit commits, live-source mounts and silent patch discovery.
+Use the same resolver and runtime path for planning, existing allocations and batch execution, with read-only/no-subprocess planning preserved.
+Test missing/wrong-base patches, failed application, reordered assets, path escape, partial preparation, changed archive/file hashes and wrong runtime import origin.
+Preserve the unpatched source mode and retain both input patch bytes and resulting source identity.
+For a source-kernel comparison, run the same patched snapshot in both arms with its default-off selector changed explicitly, so source identity is not an extra uncontrolled difference.
+Do not rebuild the image merely to test a default-off Python backport if this reviewed source path is sufficient.
+
+### E: pipeline communication and later optimizer work
+
+Prepare a6-0002 even-PP communicator split separately from native UCCL.
+Confirm that the selected schedule uses the unbatched `_p2p_ops` consumer; prove matching communicator/peer choices and rank-wide setting agreement before testing PP4/VPP2 fill, steady state and flush.
+Retain send/receive completion, buffer ownership, gradients and failure teardown.
+The existing warmup/flush-overlap implementation can be tested later as its own scheduling change; the historical a4-0004 CLI alias is not missing functionality.
+Do not bundle communicator split with that overlap switch, lazy waits, sync removal or an EP backend replacement.
+
+Keep Muon workspace reuse and k7 batched expert updates in a bounded CPU/source queue, not the first GPU wave.
+Their review must cover reentrancy, asynchronous scratch ownership, exact update arithmetic, per-parameter state and checkpoint restore before allocation timing can count as a win.
+Keep T6/T7/T8 dispatchers, FP8 transport, dispatch stashes, delayed/fused wgrad, side streams and global update-consensus removal out of this wave.
+Existing communication warmup consumers must not be duplicated.
+
+### Release and stop rules
+
+Each GPU proposal requires focused CPU checks, explicit experiment inputs, immutable source/image/tooling identity, fresh placement review and a bounded resource approval.
+Give each component proposal a stated case count, numerical/compiler requirements, timing schedule, success rule and maximum attempts before using GPUs.
+New failures stop that candidate for review; independent ready tracks may continue without automatic retries or budget growth.
+After a component win, test the real import/dispatch, recomputation and parameter/checkpoint behavior, then run a separate full-model comparison.
+Promote only confirmed winners and their required compatibility fixes into the separate image-recipe repository through the normal build/publish tools.
+Do not rebuild or publish a combined patch image while its only candidates are negative, compiler-unqualified or unmeasured.
+Requalify a rebuilt image, then test interactions between accepted changes separately; independent gains cannot simply be added.
+
+### Review inputs
+
+The retained [parent patch audit](../artifacts/investigations/performance-next/restart-20261116/imanol-patch-audit/PARENT-REVIEW.md) and its GEMM, AITER/KDA and communication reports define patch dependencies and unsafe bundles.
+The [isolated patch inventory](patches/README.md) records staged default-off candidates and compatibility fixes.
+The current status supersedes the early audit's pending-test recommendations; the audit files remain historical evidence.
+This wave does not reopen the accepted UCCL numerical decision, promote negative timings or erase compiler qualification failures.

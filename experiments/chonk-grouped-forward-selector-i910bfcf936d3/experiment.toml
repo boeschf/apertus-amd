@@ -1,0 +1,18 @@
+# PREPARATION ONLY; separate fresh placement/approval and --time 00:05:00 required.
+# Synthetic16-group public TE forward accuracy only; no timing/production-routing claim.
+nodes = 1
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "1"
+MAX_JOBS = "2"
+NCCL_P2P_DISABLE = "1"
+
+[procedure]
+kind = "commands"
+timeout = 180
+validation = "../validation/chonk_grouped_forward_probe.py"
+commands = [["python3", "-u", "/apertus/validation.py", "run"]]

@@ -210,6 +210,10 @@ The default `installed-sources` mode rejects missing or drifted native sources; 
 Both modes retain the same numerical and table-consumption gates, and numerical failure stops before tuning or timing acceptance.
 Component timing, cache consumption and numerical success remain separate from full-model equivalence or training-speedup acceptance.
 
+[chonk-kda-projection-forward-i910bfcf936d3](chonk-kda-projection-forward-i910bfcf936d3/experiment.toml) separately qualifies only the default native TE forward for that source-derived projection on the combined image.
+Each independent local GPU rank uses fresh descriptor-proof and quiet-measurement workers under one shared deadline, checks numerical/provenance/algorithm agreement, and retains every selected timing sample.
+Default algorithm identity is observed rather than forced; this does not qualify tuning, gradients, accumulated wgrad or production layouts, and does not waive the full-projection control's failure.
+
 [chonk-kda-projection-failure-capture-icb5a384016a9](chonk-kda-projection-failure-capture-icb5a384016a9/experiment.toml) stops at the projection probe's default-prefix unfused accumulation gate, preserving its original numerical failure rather than tuning or timing.
 It retains bounded raw BF16 input vectors, native and reference contribution bits, and independent copy/add diagnostics for exact offline analysis without additional native GEMMs.
 Select the explicit five-minute `cscs` launch envelope; capture completion or nonreproduction is not numerical acceptance and never authorizes tuning or a retry.
@@ -218,14 +222,65 @@ Select the explicit five-minute `cscs` launch envelope; capture completion or no
 It requires explicit five-minute/2-GiB site overrides; file absence or mismatched provenance is retained as an observation rather than an inventory-execution failure.
 Inventory success does not waive the projection probe's source gate, select runtime-loaded libraries or attest binary/source correspondence.
 
+[chonk-grouped-kernel-source-inventory-i910bfcf936d3](chonk-grouped-kernel-source-inventory-i910bfcf936d3/experiment.toml) retrieves bounded installed TE grouped-linear/Triton Python source and distribution metadata without vendor imports or GPU calls.
+Known caller hashes, stable regular-file reads, selected wheel-RECORD correspondence and four-rank agreement gate later source export and API review.
+It addresses grouped-backend source readiness, not kernel execution, numerical/performance acceptance or actual production EP16 routing/layout capture.
+
+[chonk-grouped-forward-selector-i910bfcf936d3](chonk-grouped-forward-selector-i910bfcf936d3/experiment.toml) independently qualifies the installed public TE GroupedLinear baseline and existing Triton selector on synthetic16-group FC1/FC2 balanced and ragged counts.
+Fresh selector workers use identical canonical BF16 operands, natural config=None and complete per-expert FP32-reference element/RMS checks, including empty experts; selected Python-consumer counts are not native-kernel attestation.
+This forward-only component does not waive accumulated-wgrad failures or establish production EP16 layouts, backward or performance.
+
+[chonk-grouped-forward-performance-i910bfcf936d3](chonk-grouped-forward-performance-i910bfcf936d3/experiment.toml) prepares matched public-API timing on the same fixed synthetic cases with fresh ABBA/BAAB workers, complete pre/post accuracy and immutable operand checks.
+Timing includes ordinary dispatch, wrapper weight-stack/transpose, allocations and output release; compiler/cache observations and branch wrappers stay outside batches.
+Its conservative fixed replica-consistency analysis is conditional on the declared schedule, not statistical significance, a universal speedup threshold or a training-throughput claim.
+Execution requires separate source/freeze/placement approval under the reviewed600-second allocation,510-second command and480-second shared-worker caps; no automatic retry or extension is selected.
+
 [combined-uccl-aiter-components-i910bfcf936d3](combined-uccl-aiter-components-i910bfcf936d3/experiment.toml) selects the published combined candidate for two serial, bounded two-node/eight-rank component checks: private-copy AITER core reuse/RMSNorm, then exact UCCL dispatch/combine and post-destroy storage/stream/RCCL lifetime.
 The selected wrapper pins embedded scripts/seed metadata, preserves four visible devices and chooses the Slurm local GPU before executing each embedded test in the same process.
 It does not source the broad reference-optimization environment, change vendor code or publish compiler caches.
 The UCCL test uses a deterministic 32-token/hidden-512 proxy; passing it would not establish autograd, the Megatron dispatcher, Chonk geometry, full-model training or performance acceptance.
 
+[uccl-library-ep-i910bfcf936d3](uccl-library-ep-i910bfcf936d3/experiment.toml) runs the pinned UCCL library's own EP tests with their original numerical assertions.
+It uses two independent four-GPU intra-node groups, then eight-GPU inter-node, low-latency and dual-buffer construction tests on the same exclusive two-node allocation.
+High-throughput cases use4096tokens/hidden7168/top8/256experts; low-latency uses128tokens/hidden7168/top8/288experts; dual-mode uses8tokens/hidden1024/16experts.
+The intra-node entry point retains its original tuning tail; inter-node and low-latency call the original correctness functions once through their supported skip_benchmark argument, without entering unbounded pressure loops.
+Frozen test/helper sources are copied into the run before submission, with the buffer ownership patch matching the installed image; no library or test assertion is rewritten.
+The explicit [CXI repeat](uccl-library-ep-cxi-i910bfcf936d3/experiment.toml) adds UCCL_EP_TRANSPORT=cxi, UCCL_SOCKET_IFNAME=hsn and UCCL_CXI_THREADING=safe, preserving the original experiment and failed run.
+The original experiment omitted UCCL's transport selector; FI_PROVIDER=cxi alone does not select its native backend.
+
+The [EP16 all-to-all control](moe-chonk-kda-ep16-alltoall-i910bfcf936d3/experiment.toml) and [native UCCL candidate](moe-chonk-kda-ep16-uccl-i910bfcf936d3/experiment.toml) compare dispatchers in otherwise matched 64-GPU KDA Chonk mock-data training.
+Both use the routing fix, image 910, `moe_act` and the same explicit CXI environment; the all-to-all control does not consume the flex backend selector.
+These inputs target 60 updates and retain windows 11–26 and 45–60; they do not by themselves authorize an allocation.
+Each command has a360-second limit under an explicit30-minute cscs allocation, with private retained caches and an initial all-rank guard refusing pre-existing EP shared-memory barrier files.
+Upstream similarity/error checks are distinct from the Megatron elementwise/RMS comparison; success or failure does not retrospectively change that comparison or establish full-model correctness/performance.
+
 [combined-aiter-attention-i910bfcf936d3](combined-aiter-attention-i910bfcf936d3/experiment.toml) separately checks direct AITER causal BF16 attention forward/backward at `[1,128,2,128]`, without selecting the bundled Turbo/FP8/reference environment.
 It preserves the candidate's existing forward tolerance and pinned backward policy against CPU FP64 SDPA plus an independent BF16 math control, retaining original elementwise gradient mismatch counts.
 Each rank selects its local GPU and uses private JIT caches; passing this small attention component would not validate the complete reference Turbo stack, native dispatcher or full training geometry.
+
+The [Turbo CK FC1 component](chonk-turbo-ck-forward-i910bfcf936d3/experiment.toml) compares explicit Turbo CK against the default TE grouped path on synthetic Chonk-shaped BF16 forward cases.
+The candidate includes copying the separate expert weights on every call; the result does not measure FC2, backward, or training.
+
+[chonk-kda-attention-shape-i910bfcf936d3](chonk-kda-attention-shape-i910bfcf936d3/experiment.toml) qualifies nominal B1/S4096/Q28/KV7/D128 BF16 causal attention through baseline-enabled TE and the public direct AITER API, without timing or selecting a production optimization.
+It retains one monolithic full-head BF16 MATH GQA control and original whole-Q/K/V gradient gates; only independent FP32/FP64 CPU references are tiled.
+An installed-Torch tiny self-check and read-only effective precision check precede GPU tensor creation; source pins and planning-memory guards do not establish native peak fit, correctness or binary/source correspondence.
+Workers use private caches under the unchanged command supervisor, and failed scratch is retained rather than harvested or published.
+
+[chonk-output-gate-qualification-i910bfcf936d3](chonk-output-gate-qualification-i910bfcf936d3/experiment.toml) prepares an isolated forward/dx/dgate check of the repaired output-gate helper against the unchanged default-compiled e242 method and independent FP64 formulas with final BF16 casts.
+It embeds the hash-verified applied helper and minimally adapted original method, not a live Megatron checkout or a patched training arm.
+Actual global-attention shapes, strided offset views, short/tail cases and saturated/near-zero gates use full-tensor element/RMS checks plus informational numeric and raw-bit BF16 mismatch/ULP diagnostics.
+The pointwise thresholds remain proposed pending explicit component-policy approval; CPU/source checks do not establish native accuracy, production flag dispatch, checkpoint/recompute interaction or performance.
+Private compiler caches remain job-owned and retained until a separate quiescent cleanup decision; no cache publication or full-model source-provenance shortcut is selected.
+
+[chonk-output-gate-performance-i910bfcf936d3](chonk-output-gate-performance-i910bfcf936d3/experiment.toml) times the same isolated helper against the unchanged default-compiled reference with fixed operands, full pre/post numerics and matched ABBA/BAAB autograd batches.
+Its primary synchronized host-completion clock includes Python/autograd/copy/allocation costs; the event span is not summed kernel time.
+All raw samples, memory peaks and readonly compiler/cache proof remain authoritative even when the component-specific performance rule does not qualify a gain; neither a valid measurement nor numerical success authorizes image promotion.
+
+[chonk-sssglu-qualification-i910bfcf936d3](chonk-sssglu-qualification-i910bfcf936d3/experiment.toml) checks the isolated default-off same-equation SSSGLU patch using embedded exact base/applied/helper sources and declared default-compile/disabled-NVTX import adapters.
+Fresh plain and weighted workers cover D1920 nominal4096/32768rows plus129/1/0tails, a nominal3D shared input and an offset/strided weighted upstream gradient.
+Output, both input-gradient halves and FP32 probability gradients use complete tiled FP64 references and unchanged element rtol0.015625/atol0.00390625 plus RMS rtol0.015625/atol1e-5 gates against both arms and their compiled baseline.
+Default-off/on/fallback dispatch, compiler/cache evidence, immutable operands and strict closed worker/rank records are required; no timing, production imports, selective checkpoint/recompute, optimizer or full-model equivalence is established.
+Private caches/source exports are retained under600-second allocation/510-second command/480-second shared-worker caps, with separate one-shot frozen-input and fresh-placement approval required before execution.
 
 [combined-aiter-attention-parallel-i910bfcf936d3](combined-aiter-attention-parallel-i910bfcf936d3/experiment.toml) retains that attention workload and numerical policy while changing only private-build concurrency from two to eight workers per rank and enabling verbose AITER build logs.
 It rejects unexpected prebuild-thread division and Ninja-consumer source drift, retains the original 720-second command/15-minute allocation bounds, and does not promise compilation completion or authorize automatic retries.
