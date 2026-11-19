@@ -72,6 +72,10 @@ def batch_script(value: dict, directory: Path) -> str:
         directives["reservation"] = resource["reservation"]
     if resource.get("dependency"):
         directives["dependency"] = resource["dependency"]
+    if resource.get("exclude"):
+        directives["exclude"] = resource["exclude"]
+    if resource.get("nodelist"):
+        directives["nodelist"] = resource["nodelist"]
     if resource.get("uenv_passthrough"):
         directives["uenv-passthrough"] = resource["uenv_passthrough"]
     lines = ["#!/bin/bash", "#SBATCH --exclusive"]
