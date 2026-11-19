@@ -114,7 +114,7 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     resources = dict(settings["slurm"])
     if "nodes" in value:
         resources["nodes"] = value["nodes"]
-    for key in ("nodes", "gpus_per_node", "cpus_per_task", "memory_gb", "time", "cpu_bind", "distribution", "reservation", "dependency"):
+    for key in ("nodes", "gpus_per_node", "cpus_per_task", "memory_gb", "time", "cpu_bind", "distribution", "reservation", "dependency", "exclude", "nodelist"):
         if overrides.get(key) is not None:
             resources[key] = overrides[key]
     for key in ("nodes", "gpus_per_node", "cpus_per_node"):
@@ -132,6 +132,8 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     job_id = overrides.get("job_id")
     if bool(job_id) == bool(overrides.get("submit")):
         raise ValueError("select exactly one of job-id or submit")
+    if resources.get("nodelist") and not re.fullmatch(r"nid[0-9]{6}(,nid[0-9]{6})*", resources["nodelist"]):
+        raise ValueError("nodelist must be a comma-separated list of nidXXXXXX node names")
     if resources.get("dependency") and (not overrides.get("submit") or not re.fullmatch(
             r"(?:afterany|afterok):[0-9]+(?::[0-9]+)*", resources["dependency"])):
         raise ValueError("dependency requires batch submission and afterany:JOB_ID or afterok:JOB_ID")

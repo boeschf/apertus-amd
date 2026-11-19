@@ -85,6 +85,7 @@ uv run --locked apertus run experiments/dense-multinode-mc56351143a8e-ie84d7ba62
 
 If you have reservation access, add `--reservation NAME` when submitting.
 To queue a run after another job, use `--dependency afterany:JOB_ID`, or `afterok:JOB_ID` to require its success.
+To keep a suspect node out of a new allocation, use `--exclude NODELIST` (for example `--exclude nid002418`); it is recorded in the run's `job.sh` and `resolved.json`.
 Resource overrides include `--nodes`, `--gpus-per-node`, `--cpus-per-task`, `--memory-gb`, `--time`, `--cpu-bind`, and `--distribution`.
 Each included experiment records its intended allocation in top-level `nodes`; precedence is `--nodes`, then experiment `nodes`, then site `[slurm].nodes`.
 Rank placement is block across nodes; the site supplies within-node placement, CPU binding, MPI, and network options.

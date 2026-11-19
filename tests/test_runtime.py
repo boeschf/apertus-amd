@@ -111,9 +111,12 @@ def test_step_failure_retains_inputs_without_source_copies(prepared, tmp_path, m
 
 @pytest.mark.parametrize("reservation", [None, "cscs"])
 @pytest.mark.parametrize("dependency", [None, "afterany:98765"])
-def test_batch_is_thin_and_submitted_once(prepared, tmp_path, monkeypatch, reservation, dependency):
+@pytest.mark.parametrize("exclude", [None, "nid002418"])
+@pytest.mark.parametrize("nodelist", [None, "nid002412,nid002414"])
+def test_batch_is_thin_and_submitted_once(prepared, tmp_path, monkeypatch, reservation, dependency, exclude, nodelist):
     prepared["launch"] = {"submit": True, "job_id": None}
-    prepared["resources"].update(nodes=2, reservation=reservation, dependency=dependency)
+    prepared["resources"].update(nodes=2, reservation=reservation, dependency=dependency, exclude=exclude,
+                                 nodelist=nodelist)
     calls = []
     def submit(command, **kwargs):
         calls.append(command)
@@ -128,6 +131,8 @@ def test_batch_is_thin_and_submitted_once(prepared, tmp_path, monkeypatch, reser
     assert "#SBATCH --nodes=2" in script
     assert ("#SBATCH --reservation=cscs" in script) == bool(reservation)
     assert ("#SBATCH --dependency=afterany:98765" in script) == bool(dependency)
+    assert ("#SBATCH --exclude=nid002418" in script) == bool(exclude)
+    assert ("#SBATCH --nodelist=nid002412,nid002414" in script) == bool(nodelist)
     assert "#SBATCH --uenv-passthrough=ignore" in script
     assert "apertus_amd.runs" in script and "--num-layers" not in script
 
