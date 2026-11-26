@@ -45,6 +45,8 @@ def main() -> None:
     parser.add_argument("--reservation", help="optional Slurm reservation for a new allocation")
     parser.add_argument("--exclude", help="comma-separated node names to exclude from a new allocation")
     parser.add_argument("--dependency", help="batch dependency: afterany:JOB_ID or afterok:JOB_ID")
+    parser.add_argument("--exclude", help="Slurm node list to keep out of a new allocation, e.g. nid002418")
+    parser.add_argument("--nodelist", help="Slurm node list to pin a new allocation to, e.g. nid002412,nid002414")
     parser.add_argument("--cpu-bind")
     parser.add_argument("--distribution", help="Slurm block:<within-node policy>; defaults to the site setting")
     parser.add_argument("--cache-mode", choices=("auto", "cold", "warm"), default="auto")
