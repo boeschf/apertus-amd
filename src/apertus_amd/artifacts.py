@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import stat
 import tempfile
 
 
@@ -44,3 +46,45 @@ def image_manifest(image: Path, checksum: str) -> dict:
     with image.open("rb"):
         pass
     return manifest
+
+
+def cache_image(registry: Path, target: Path, checksum: str) -> None:
+    """Verify or stage one image without replacing an existing cache object."""
+    def verify(path: Path) -> None:
+        if not stat.S_ISREG(path.lstat().st_mode) or sha256(path) != checksum:
+            raise ValueError(f"invalid cached image: {path}; refusing to replace it")
+
+    # The managed cache path has four directory components under the checkout.
+    # Do not follow redirections back to the registry or to another cache.
+    for directory in reversed(target.parents[:4]):
+        directory.mkdir(exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError(f"invalid image cache directory: {directory}")
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        verify(target)
+        return
+
+    manifest = image_manifest(registry, checksum)
+    fd, name = tempfile.mkstemp(prefix=".image.sqsh-", dir=target.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as destination, registry.open("rb") as source:
+            shutil.copyfileobj(source, destination, length=8 * 1024 * 1024)
+            destination.flush()
+            if os.fstat(destination.fileno()).st_size != manifest["artifacts"]["image.sqsh"]["bytes"]:
+                raise ValueError(f"cached image size differs from registry manifest: {registry}")
+            os.fchmod(destination.fileno(), 0o444)
+            os.fsync(destination.fileno())
+        verify(temporary)
+        # Publish atomically on the target filesystem, with no overwrite even if
+        # another launch won the race. The link is only made after verification.
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            verify(target)
+    finally:
+        temporary.unlink(missing_ok=True)

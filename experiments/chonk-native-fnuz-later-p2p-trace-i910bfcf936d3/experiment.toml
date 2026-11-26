@@ -1,0 +1,127 @@
+# Keep node-verified CK prewarm and trace the three P2P edges into the later dispatch timeouts.
+nodes = 16
+entrypoint = "pretrain_gpt.py"
+prepare = [["make", "-C", "megatron/core/datasets"]]
+args = [
+  "--num-layers", "42", "--hidden-size", "3584", "--ffn-hidden-size", "8960",
+  "--num-attention-heads", "28", "--group-query-attention", "--num-query-groups", "7",
+  "--kv-channels", "128", "--normalization", "RMSNorm", "--qk-layernorm", "--sandwich-norm",
+  "--residual-output-scaling", "--scale-embeddings-by-sqrt-hidden",
+  "--untie-embeddings-and-output-weights", "--disable-bias-linear", "--sssglu",
+  "--position-embedding-type", "rope", "--rotary-base", "10000", "--no-rope-freq", "1",
+  "--seq-length", "4096", "--max-position-embeddings", "4096",
+  "--vocab-size", "200063", "--make-vocab-size-divisible-by", "128",
+  "--attention-dropout", "0", "--hidden-dropout", "0", "--init-method-std", "0.0167038",
+  "--enable-experimental", "--experimental-attention-variant", "kda",
+  "--linear-attention-freq", "([1,1,1,0]*10+[1,0])",
+  "--linear-attention-safe-output-gate", "--attention-output-gate", "--kda-legacy-gate-out-proj-bias",
+  "--linear-conv-kernel-dim", "4", "--linear-key-head-dim", "128", "--linear-value-head-dim", "128",
+  "--linear-num-key-heads", "28", "--linear-num-value-heads", "28",
+  "--transformer-impl", "transformer_engine", "--attention-backend", "auto",
+  "--num-experts", "256", "--moe-router-topk", "8", "--moe-layer-freq", "([0]*3+[1]*39)",
+  "--moe-ffn-hidden-size", "1920", "--moe-latent-size", "1792",
+  "--moe-shared-expert-intermediate-size", "1920", "--moe-grouped-gemm", "--moe-permute-fusion",
+  "--moe-token-dispatcher-type", "flex", "--moe-flex-dispatcher-backend", "deepep",
+  "--moe-router-score-function", "sigmoid", "--moe-router-dtype", "fp32",
+  "--moe-router-topk-scaling-factor", "2.5", "--moe-router-load-balancing-type", "quantile_balancing",
+  "--moe-aux-loss-coeff", "0.001", "--moe-router-quantile-balancing-method", "histogram",
+  "--moe-router-quantile-balancing-ema", "0", "--moe-router-quantile-balancing-num-bins", "1000",
+  "--moe-per-layer-logging",
+  "--tensor-model-parallel-size", "1", "--pipeline-model-parallel-size", "4",
+  "--pipeline-model-parallel-layout", "Ettt|(tttttt|)*2,(ttttt|)*2,(tttttt|)*2,tttttL",
+  "--context-parallel-size", "1", "--expert-model-parallel-size", "16", "--expert-tensor-parallel-size", "1",
+  "--micro-batch-size", "2", "--global-batch-size", "4096", "--bf16", "--main-grads-dtype", "fp32",
+  "--optimizer", "md_decoupling", "--use-layer-wise-distributed-optimizer", "--weight-decay", "0",
+  "--use-orthogonal-updates", "--muon-coefficient-type", "polar_express", "--muon-scale-mode", "shape_up",
+  "--muon-router-scale-mode", "none", "--muon-momentum", "0.95", "--muon-use-nesterov",
+  "--hypersphere-mode", "row", "--hypersphere-embedding-mode", "row", "--hypersphere-router-mode", "row",
+  "--hypersphere-radius-mode", "fan_in", "--md-router-use-orthogonal-updates", "True",
+  "--hypersphere-gains-mode", "rowcol", "--hypersphere-gains-mode-router", "rowcol",
+  "--hypersphere-gains-mode-embedding", "none", "--gain-parametrization", "softplus",
+  "--lr", "0.00616", "--matrix-lr", "0.0308", "--gains-lr", "0.00616",
+  "--min-lr", "0.0001", "--min-lr-mode", "absolute", "--lr-decay-style", "linear",
+  "--adam-beta1", "0.9", "--adam-beta2", "0.95", "--clip-grad", "1",
+  "--recompute-granularity", "selective",
+  "--recompute-modules", "layernorm", "linear_attn", "qkv", "shared_experts",
+  "--seed", "42", "--dataloader-type", "single", "--mock-data", "--tokenizer-type", "NullTokenizer",
+  "--split", "100,0,0", "--num-workers", "0", "--no-create-attention-mask-in-dataloader",
+  "--cross-entropy-loss-fusion", "--no-check-for-nan-in-loss-and-grad",
+  "--check-grad-norm", "--check-grad-norm-threshold", "5.0",
+  "--eval-iters", "0", "--eval-interval", "100000",
+  "--manual-gc", "--manual-gc-interval", "100", "--distributed-timeout-minutes", "20",
+  "--log-interval", "1", "--log-throughput", "--log-progress", "--log-params-norm",
+  "--log-memory-interval", "20",
+  "--log-muon-gains", "--log-muon-sparsity", "--log-muon-per-layer",
+  "--muon-sparsity-thresholds", "1e-8", "1e-12", "--muon-log-interval", "200",
+  "--train-iters", "1", "--lr-warmup-iters", "100", "--lr-decay-iters", "59604",
+  "--ckpt-format", "torch_dist",
+  "--overlap-grad-reduce", "--overlap-moe-expert-parallel-comm", "--delay-wgrad-compute",
+  "--no-gradient-accumulation-fusion", "--cuda-graph-impl", "none",
+  "--moe-use-fp8-dispatch", "--moe-fp8-dispatch-fnuz", "--moe-resident-fp8-fnuz",
+  "--lm-head-token-chunk-size", "512",
+  "--moe-resident-fp8-fnuz-recompute-fc1",
+]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "ceb8035c182c40711db4d256d99fc44e4b8db27e"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+KDA_ALOG_PER_CHANNEL = "0"
+KDA_USE_GATE_IN_KERNEL = "1"
+KDA_FUSED_GATE = "1"
+KDA_QK_L2NORM_IN_KERNEL = "1"
+KDA_CONV1D_CUDA = "1"
+KDA_FUSED_LOW_RANK_GATHER = "1"
+TORCH_COMPILE_DISABLE = "0"
+TORCH_NCCL_ASYNC_ERROR_HANDLING = "1"
+TORCH_CPP_LOG_LEVEL = "WARNING"
+OMP_NUM_THREADS = "18"
+NUMEXPR_NUM_THREADS = "18"
+NUMEXPR_MAX_THREADS = "512"
+TOKENIZERS_PARALLELISM = "false"
+MAX_JOBS = "8"
+TORCHINDUCTOR_COMPILE_THREADS = "4"
+NCCL_DEBUG = "INFO"
+NCCL_P2P_DISABLE = "0"
+OFI_NCCL_PROTOCOL = "SENDRECV"
+NCCL_CROSS_NIC = "0"
+NCCL_PXN_DISABLE = "1"
+NCCL_NET_GDR_LEVEL = "PHB"
+NCCL_NET_FORCE_FLUSH = "1"
+HSA_ENABLE_IPC_MODE_LEGACY = "1"
+NCCL_P2P_LEVEL = "SYS"
+UCCL_EP_TRANSPORT = "cxi"
+UCCL_SOCKET_IFNAME = "hsn"
+UCCL_CXI_THREADING = "safe"
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+BEVERIN_COMM_WARMUP = "1"
+BEVERIN_COMM_WARMUP_PARTS = "ar,p2p,a2a"
+NCCL_RUNTIME_CONNECT = "0"
+SS_BALLAST_GB = "0"
+APERTUS_COMPILE_TRACE = "1"
+APERTUS_CHONK_NOTIFY_TRACE = "1"
+APERTUS_CHONK_DEPENDENCY_TRACE = "1"
+APERTUS_CHONK_PREFIX_TRACE = "1"
+APERTUS_CHONK_P2P_PAIR_TRACE = "1"
+APERTUS_CHONK_CK_PREWARM = "node-verified"
+APERTUS_CHONK_LATER_P2P_TRACE = "1"
+TORCH_LOGS = "recompiles,graph_breaks"
+NVTE_FLASH_ATTN = "1"
+NVTE_FUSED_ATTN = "1"
+NVTE_UNFUSED_ATTN = "1"
+
+[procedure]
+kind = "probe"
+gpu_identity_timeout = 600
+startup_trace = true
+memory_telemetry = true
+memory_mapping_ranks = [48, 51, 52, 55, 56, 59, 60, 63]
+timeout = 2700
+validation = "../validation/chonk_fnuz_oom.py"
+launch_blocked = "One-shot full-layout later P2P trace submitted as job 762353; no further launch is authorized."

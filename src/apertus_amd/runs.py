@@ -12,13 +12,22 @@ import sys
 import uuid
 
 from . import sources
-from .artifacts import image_manifest, sha256, write_json
+from .artifacts import cache_image, image_manifest, sha256, write_json
+from .config import require_launchable
 
 
 def step_command(value: dict, directory: Path, *, cpus=None, job_id=None) -> list[str]:
     """Render one task per GPU; allocation-derived CPU counts can remain symbolic in plans."""
     resource = value["resources"]
     cpus = cpus or resource.get("cpus_per_task") or "<allocated CPUs per node / ranks per node>"
+    procedure = value["procedure"]
+    startup_trace = procedure.get("startup_only", False) or procedure.get("startup_trace", False)
+    shell = 'exec "$@"'
+    if startup_trace:
+        shell = (
+            'printf \'APERTUS_STARTUP_SHELL rank=%s node=%s epoch=%s\\n\' '
+            '"$SLURM_PROCID" "$SLURM_NODEID" "$EPOCHREALTIME" >&2; exec "$@"'
+        )
     command = ["srun", f"--jobid={job_id or value['launch']['job_id'] or '<assigned-job-id>'}",
                "--overlap", "--exact", "--kill-on-bad-exit=1", "--unbuffered",
                f"--distribution={resource['distribution']}", f"--mpi={resource['mpi']}", f"--network={resource['network']}",
@@ -32,8 +41,10 @@ def step_command(value: dict, directory: Path, *, cpus=None, job_id=None) -> lis
                "env", "-u", "CUDA_VISIBLE_DEVICES", "-u", "HIP_VISIBLE_DEVICES",
                 # The image's BASH_ENV initializes its runtime defaults even
                 # when its entrypoint simply execs the supplied command.
-                "bash", "-c", 'exec "$@"', "apertus",
-                "python3", "-u", "-m", "apertus_amd.runtime"]
+                 "bash", "-c", shell, "apertus",
+                 "python3", "-u", "-m", "apertus_amd.runtime"]
+    if startup_trace:
+        command.append("--startup-trace")
     return command
 
 
@@ -44,8 +55,9 @@ def edf(value: dict, directory: Path) -> str:
                          f"{directory}/resolved.json:/apertus/resolved.json:ro",
                           "/dev/shm:/dev/shm"]}
     if "source_snapshot" in value:
-        values["mounts"] += [f"{value['source_snapshot']['directory']}:/apertus/source:ro",
-                              f"{value['data_root']}/cache:/apertus/cache"]
+        values["mounts"].append(f"{value['source_snapshot']['directory']}:/apertus/source:ro")
+        if value["procedure"]["kind"] != "probe":
+            values["mounts"].append(f"{value['data_root']}/cache:/apertus/cache")
     if value["validation"]:
         values["mounts"].append(f"{directory}/validation.py:/apertus/validation.py:ro")
     # GL display discovery can block in XOpenDisplay during OFI topology loading.
@@ -74,6 +86,8 @@ def batch_script(value: dict, directory: Path) -> str:
         directives["reservation"] = resource["reservation"]
     if resource.get("dependency"):
         directives["dependency"] = resource["dependency"]
+    if resource.get("exclude"):
+        directives["exclude"] = resource["exclude"]
     if resource.get("uenv_passthrough"):
         directives["uenv-passthrough"] = resource["uenv_passthrough"]
     lines = ["#!/bin/bash", "#SBATCH --exclusive"]
@@ -89,6 +103,7 @@ def batch_script(value: dict, directory: Path) -> str:
 def launch(directory: Path, job_id: str) -> None:
     """Wait for the step; ranks own runtime evidence even if this controller disconnects."""
     value = json.loads((directory / "resolved.json").read_text())
+    require_launchable(value)
     record = json.loads((directory / "launch.json").read_text())
     try:
         cpus = value["resources"].get("cpus_per_task")
@@ -160,6 +175,7 @@ def native_steps(value: dict, directory: Path, command: list[str], env: dict, la
 
 def run(value: dict, checkout: Path | None = None) -> Path:
     """Prepare once, then submit once or execute in an explicitly selected allocation."""
+    require_launchable(value)
     root = Path(value["data_root"])
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     directory = root / "runs" / value["experiment"] / run_id
@@ -167,13 +183,21 @@ def run(value: dict, checkout: Path | None = None) -> Path:
     (directory / "output").mkdir()
     print(f"Run: {directory}", file=sys.stderr, flush=True)
     try:
-        image_manifest(Path(value["image_path"]), value["image"]["sha256"])
+        image_path = Path(value["image_path"])
+        if "registry_image_path" in value:
+            print(f"Preparing cached image: {image_path}", file=sys.stderr, flush=True)
+            cache_image(Path(value["registry_image_path"]), image_path, value["image"]["sha256"])
+        else:
+            image_manifest(image_path, value["image"]["sha256"])
         if value["procedure"]["kind"] != "commands":
-            (root / "cache").mkdir(exist_ok=True)
+            if value["procedure"]["kind"] != "probe":
+                (root / "cache").mkdir(exist_ok=True)
             source = sources.prepare(value["source"], root / "sources", local=checkout)
             if value["entrypoint"] not in source["files"]:
                 raise ValueError("selected source does not contain entrypoint")
-            value = {**value, "source_snapshot": {k: source[k] for k in ("directory", "sha256", "tree")}}
+            snapshot = {k: source[k] for k in ("directory", "sha256", "tree")}
+            snapshot["manifest_sha256"] = sha256(Path(source["directory"]) / "manifest.json")
+            value = {**value, "source_snapshot": snapshot}
         package = Path(__file__).resolve().parent
         shutil.copytree(package, directory / "tooling/apertus_amd", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         if value["validation"]:

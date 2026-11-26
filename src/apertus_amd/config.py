@@ -11,7 +11,13 @@ CACHE_PATHS = {"TMPDIR": "tmp", "XDG_CACHE_HOME": "xdg", "TRITON_CACHE_DIR": "tr
                "TORCH_EXTENSIONS_DIR": "torch-extensions", "TORCHINDUCTOR_CACHE_DIR": "inductor",
                "AITER_JIT_DIR": "aiter", "MIOPEN_USER_DB_PATH": "miopen-db", "MIOPEN_CUSTOM_CACHE_DIR": "miopen"}
 RESERVED_ENV = {*CACHE_PATHS, "PYTHONPATH", "RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
-                "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "HWLOC_COMPONENTS"}
+                 "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "HWLOC_COMPONENTS"}
+
+
+def require_launchable(value: dict) -> None:
+    """Allow planning a review-only experiment, but never execute it."""
+    if "launch_blocked" in value["procedure"]:
+        raise ValueError(f"launch blocked: {value['procedure']['launch_blocked']}")
 
 
 def option(args: list[str], name: str, default=None):
@@ -32,7 +38,13 @@ def phases(experiment: dict, output: Path) -> list[dict]:
     if experiment["procedure"]["kind"] == "commands":
         return [{"name": str(index), "output": str(output / str(index)), "argv": command}
                 for index, command in enumerate(experiment["procedure"]["commands"])]
-    restart = experiment["procedure"]["kind"] == "restart"
+    kind = experiment["procedure"]["kind"]
+    if kind == "probe":
+        if experiment["procedure"].get("startup_only"):
+            return []
+        args = ["--save", str(output / "checkpoints")] if experiment["procedure"].get("checkpoint") else []
+        return [{"name": "probe", "output": str(output), "extra_args": args}]
+    restart = kind == "restart"
     result = []
     for name in (("continuous", "prefix", "resume") if restart else ("train",)):
         directory = output / name if restart else output
@@ -59,8 +71,11 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
         raise ValueError("experiment directory must have a simple experiment ID")
     value.setdefault("procedure", {"kind": "train"})
     procedure = value["procedure"]
-    if procedure["kind"] not in {"train", "restart", "commands"}:
-        raise ValueError("procedure must be train, restart, or commands")
+    if procedure["kind"] not in {"train", "restart", "commands", "probe"}:
+        raise ValueError("procedure must be train, restart, commands, or probe")
+    if "launch_blocked" in procedure and (not isinstance(procedure["launch_blocked"], str)
+                                          or not procedure["launch_blocked"].strip()):
+        raise ValueError("launch_blocked requires a nonempty review reason")
     validation = None
     if "validation" in procedure:
         script = (path.parent / procedure["validation"]).resolve()
@@ -69,6 +84,44 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
         validation = {"path": str(script), "sha256": sha256(script)}
     if procedure["kind"] == "restart" and validation is None:
         raise ValueError("restart procedure requires an explicit validation script")
+    if "memory_telemetry" in procedure and (
+        procedure["kind"] != "probe" or procedure["memory_telemetry"] is not True
+    ):
+        raise ValueError("memory_telemetry=true is supported only for bounded probes")
+    if "startup_only" in procedure and (
+        procedure["kind"] != "probe" or procedure["startup_only"] is not True
+        or "checkpoint" in procedure or "memory_telemetry" in procedure
+    ):
+        raise ValueError("startup_only=true requires a probe without checkpoint or child memory telemetry")
+    if "startup_trace" in procedure and (procedure["kind"] != "probe" or procedure["startup_trace"] is not True):
+        raise ValueError("startup_trace=true is supported only for probes")
+    if "gpu_identity_timeout" in procedure and (
+        procedure["kind"] != "probe" or type(procedure["gpu_identity_timeout"]) is not int
+        or procedure["gpu_identity_timeout"] <= 0
+    ):
+        raise ValueError("gpu_identity_timeout requires a probe and positive integer seconds")
+    if "memory_mapping_ranks" in procedure:
+        ranks = procedure["memory_mapping_ranks"]
+        if (procedure.get("memory_telemetry") is not True or not isinstance(ranks, list) or not ranks
+                or any(type(rank) is not int or rank < 0 for rank in ranks)
+                or len(set(ranks)) != len(ranks)):
+            raise ValueError("memory_mapping_ranks requires telemetry and unique nonnegative rank IDs")
+    if procedure["kind"] == "probe":
+        if type(procedure.get("timeout")) is not int or procedure["timeout"] <= 0:
+            raise ValueError("probe requires a positive timeout in seconds")
+        if overrides.get("compare_run") or overrides.get("cache_mode") not in (None, "auto", "cold"):
+            raise ValueError("probe uses no comparison or shared cache hydration/publication")
+        if "checkpoint" in procedure:
+            if procedure["checkpoint"] is not True or validation is None:
+                raise ValueError("checkpoint probe requires checkpoint=true and explicit validation")
+            args = value.get("args", [])
+            if (option(args, "--ckpt-format") != "torch_dist"
+                    or int(option(args, "--train-iters", 0)) <= 0
+                    or option(args, "--train-iters") != option(args, "--save-interval")
+                    or any(a.split("=", 1)[0] in {"--load", "--pretrained-checkpoint", "--finetune", "--async-save",
+                                                "--save-iters", "--non-persistent-save-interval", "--no-save-optim"}
+                           for a in args)):
+                raise ValueError("checkpoint probe requires one final synchronous torch_dist save without a load")
     if procedure["kind"] == "commands":
         if any(key in value for key in ("source", "entrypoint", "args", "prepare")):
             raise ValueError("commands procedure uses image executables, not source/training settings")
@@ -114,7 +167,8 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     resources = dict(settings["slurm"])
     if "nodes" in value:
         resources["nodes"] = value["nodes"]
-    for key in ("nodes", "gpus_per_node", "cpus_per_task", "memory_gb", "time", "cpu_bind", "distribution", "reservation", "dependency"):
+    for key in ("nodes", "gpus_per_node", "cpus_per_task", "memory_gb", "time", "cpu_bind", "distribution",
+                "reservation", "dependency", "exclude"):
         if overrides.get(key) is not None:
             resources[key] = overrides[key]
     for key in ("nodes", "gpus_per_node", "cpus_per_node"):
@@ -122,6 +176,9 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
             raise ValueError(f"{key} must be positive")
     if resources.get("cpus_per_task") is not None and resources["cpus_per_task"] < 1:
         raise ValueError("cpus-per-task must be positive")
+    if any(rank >= resources["nodes"] * resources["gpus_per_node"]
+           for rank in procedure.get("memory_mapping_ranks", [])):
+        raise ValueError("memory_mapping_ranks contains a rank outside the allocation")
     if resources["distribution"].split(":", 1)[0] != "block":
         raise ValueError("node-level Slurm rank distribution must be block")
     if resources["memory_gb"] < 0 or not re.fullmatch(r"\d{2,3}:[0-5]\d:[0-5]\d", resources["time"]):
@@ -135,9 +192,14 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     if resources.get("dependency") and (not overrides.get("submit") or not re.fullmatch(
             r"(?:afterany|afterok):[0-9]+(?::[0-9]+)*", resources["dependency"])):
         raise ValueError("dependency requires batch submission and afterany:JOB_ID or afterok:JOB_ID")
+    if "exclude" in resources and (
+        not overrides.get("submit") or not isinstance(resources["exclude"], str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:,[A-Za-z0-9][A-Za-z0-9_.-]*)*", resources["exclude"])
+    ):
+        raise ValueError("exclude requires batch submission and comma-separated node names")
     if job_id is not None and not re.fullmatch(r"[0-9]+", job_id):
         raise ValueError("job-id must be numeric")
-    mode = overrides.get("cache_mode") or "auto"
+    mode = "cold" if procedure["kind"] == "probe" else (overrides.get("cache_mode") or "auto")
     if mode not in {"auto", "cold", "warm"}:
         raise ValueError("cache mode must be auto, cold, or warm")
     env = {**settings.get("environment", {}), **value.get("environment", {})}
@@ -150,8 +212,14 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
     root = Path(overrides["data_root"]) if overrides.get("data_root") else site.parent / settings["data_root"]
     image = value["image"]
     image_path = Path(settings["image_stores"][image["store"]]) / "objects/sha256" / image["sha256"] / "image.sqsh"
+    if overrides.get("cache_image"):
+        # A cached run must not require even metadata access to the registry.
+        value["registry_image_path"] = str(image_path.absolute())
+        image_path = Path.cwd() / "cache" / "images" / "sha256" / image["sha256"] / "image.sqsh"
+    else:
+        image_path = image_path.resolve()
     return {"experiment": name, **value, "validation": validation, "environment": env, "resources": resources,
-            "image_path": str(image_path.resolve()), "data_root": str(root.resolve()),
+             "image_path": str(image_path), "data_root": str(root.resolve()),
             "scratch_root": str(scratch), "cache": {**settings["cache"], "mode": mode},
             "launch": {"job_id": job_id, "submit": bool(overrides.get("submit"))},
             "compare_run": str(Path(overrides["compare_run"]).resolve()) if overrides.get("compare_run") else None}

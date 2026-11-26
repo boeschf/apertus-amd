@@ -310,6 +310,118 @@ It retains bounded parser/header/version metadata without invoking help/version 
 It profiles one update after step 10 on ranks 0/1 and 32/33, covering both pipeline stages and local-rank-0 versus local-rank-1 behavior.
 Traces are retained under `output/torch_profile/`; use unprofiled runs for throughput comparisons.
 
+## Swiss-AI Chonk alignment and native FNUZ qualification
+
+The [resident preparation](chonk-swissai-resident-preparation-i910bfcf936d3/experiment.toml) pins image 910 and e242 with the corrected GH200 Chonk benchmark workload.
+The runner refuses to launch it.
+That preparation does not implement resident FP8 arithmetic, and its proposed BF16 path is not a reference-equivalent substitute.
+See the [source and capability assessment](chonk-swissai-resident-preparation-i910bfcf936d3/ALIGNMENT.md) and [separate qualification plan](chonk-swissai-resident-preparation-i910bfcf936d3/QUALIFICATION.md).
+
+The [native FNUZ expert probe](chonk-native-fnuz-experts-i910bfcf936d3/experiment.toml) uses image 910 with a signed Megatron source gate and exercises all six expert GEMMs independently of communication.
+The [native FNUZ codec](chonk-native-fnuz-codec-i910bfcf936d3/experiment.toml) and [EP16/CXI transport](chonk-native-fnuz-ep16-i910bfcf936d3/experiment.toml) probes qualify the wire and BF16 reverse path without expert GEMMs.
+The expert and transport GPU component gates passed independently.
+The [combined schedule rehearsal](chonk-native-fnuz-schedule-i910bfcf936d3/experiment.toml) is a launch-blocked, eight-node PP2/VPP2 gate that keeps EP16 and actual Chonk GEMM and transport widths.
+The [full-layout fit probe](chonk-native-fnuz-fit-i910bfcf936d3/experiment.toml) is a separately launch-blocked 16-node cold run with two full-size updates and a terminal synchronous checkpoint, without shared-cache publication.
+The [OOM diagnostic](chonk-native-fnuz-oom-i910bfcf936d3/experiment.toml) preserves the full workload for one update and streams pre-failure memory and schedule observations without checkpoint I/O.
+The [chunked LM-head component](chonk-chunked-lm-head-i910bfcf936d3/experiment.toml) passed loss, gradient, and Torch allocation gates at the actual Chonk head shape on one gfx942 rank.
+The [chunked full-layout fit probe](chonk-native-fnuz-chunked-fit-i910bfcf936d3/experiment.toml) cleared the dense-head OOM boundary in `759718`, but did not complete an update after the second pipeline stage ran out of sampled node memory and peers reported dispatch timeouts.
+It is guarded against relaunch.
+The [resident FNUZ FC1 replay component](chonk-native-fnuz-fc1-recompute-i910bfcf936d3/experiment.toml) tests recomputing one expert's saved preactivation at a time rather than retaining all preactivations through warmup.
+Job `759931` verified the standalone native replay fixture, then failed on a test-counter isolation bug before the lifecycle and allocation gates.
+The declaration is guarded against relaunch.
+The [corrected FC1 replay component](chonk-native-fnuz-fc1-recompute-check-i910bfcf936d3/experiment.toml) pins the signed test-only fix and keeps the same acceptance gates.
+It passed as job `759951`, saving 527 MiB of retained Torch allocation across two actual-shape forwards, and is guarded against relaunch.
+The [full-layout FC1 replay fit probe](chonk-native-fnuz-replay-fit-i910bfcf936d3/experiment.toml) adds qualified replay to the chunked-head workload and checks the previously failing forward warmup boundary.
+Job `759990` cleared the previous warmup memory boundary, then failed to complete an update after all final-stage ranks hit a native dispatch timeout during backward/forward overlap.
+It is guarded against relaunch.
+The [full-layout notification diagnostic](chonk-native-fnuz-notify-trace-i910bfcf936d3/experiment.toml) adds scoped, nonblocking GPU markers at that dispatch boundary, without changing the workload or transport timeout.
+Job `760048` missed the GPU identity rendezvous on 44 of 64 ranks and was cancelled before training; no dispatch markers were collected.
+It is guarded against relaunch.
+The [600-second startup retry](chonk-native-fnuz-notify-trace-startup600-i910bfcf936d3/experiment.toml) was cancelled before training as `760061`, with 12 of 64 GPU identities still missing at the extended deadline.
+It is guarded against relaunch.
+The [full-size startup and dispatch trace](chonk-native-fnuz-notify-startup-trace-i910bfcf936d3/experiment.toml) keeps the same deadlines and adds startup phase markers without skipping training.
+Job `760303` was cancelled before training; 24 ranks had started Torch import but had not reached GPU enumeration at the identity deadline.
+The trace also measured a 493-second spread in the first in-container Bash marker.
+It is guarded against relaunch.
+The [cached-image comparison](chonk-native-fnuz-notify-image-cache-i910bfcf936d3/experiment.toml) uses `--cache-image` to mount the same verified SquashFS bytes from the shared checkout, with the same startup and dispatch traces.
+Job `761653` on the `cscs` reservation cleared startup but reproduced the call-8 timeout on all 16 final-stage ranks.
+The caller and prior-UCCL markers before layout were still incomplete on every rank, as was the layout marker.
+No full-size update completed, and the declaration is guarded against relaunch.
+The [call-8 dependency trace](chonk-native-fnuz-dependency-trace-i910bfcf936d3/experiment.toml) marks the existing stream waits and reverse BF16 exchange before the same FNUZ dispatch.
+Job `761667` reproduced the timeout on all 16 final-stage ranks: compute passed call entry but did not reach the marker before forward preprocessing, and Megatron communication did not pass the backward post-combine wait.
+No full-size update completed, and the declaration is guarded against relaunch.
+The [call-8 compute prefix trace](chonk-native-fnuz-prefix-trace-i910bfcf936d3/experiment.toml) adds markers for batch/plan preparation, initial loss backward, and the existing forward receive callback.
+Job `761767` reproduced the timeout on all 16 final-stage ranks: the compute marker before the forward receive callback completed, the one after it did not, and the callback consumed one handle per rank.
+No full-size update completed, and the declaration is guarded against relaunch.
+The [matched pipeline P2P trace](chonk-native-fnuz-p2p-pair-trace-i910bfcf936d3/experiment.toml) observes both sides of the stage-2-to-stage-3 transfer for virtual forward 7.
+Job `762041` matched all 16 stage-3 receives to their local wait handles, but no stage-2 sender reached the matching `isend` hook before the timeout.
+The sender GPU markers cleared the backward receive callback; no full-size update completed.
+The declaration is guarded against relaunch.
+The retained sender logs show all 16 stage-2 ranks building the same native CK attention-backward kernel, with compiler descendants still sampled just before the receiver timeout in `762041`.
+Cold attention-backward compilation is the leading explanation for the missing send; exact-shape prewarming has not yet been qualified.
+The [one-node CK backward reuse check](chonk-ck-attention-bwd-reuse-i910bfcf936d3/experiment.toml) requires a cold native B2/S4096 build, finite gradients, and reuse of the verified object in a fresh private cache.
+Job `762106` passed: native CK backward took 28.530 s cold and 26.651 ms with the verified object in a fresh private cache, with identical finite output and gradient norms.
+No shared cache was published; the result does not establish full-layout fit or cache reuse.
+The declaration is guarded against relaunch.
+The [full-layout CK prewarm diagnostic](chonk-native-fnuz-ck-prewarm-i910bfcf936d3/experiment.toml) verifies the exact qualified object before seeding each rank privately and retesting the matched P2P boundary.
+Job `762207` was submitted once on the `cscs` reservation with a one-time approved overlap with the one-node export `761959`.
+All 16 builders reported compilation success but failed the pinned artifact check before training; the effect of prewarming on the call-8 stall remains untested.
+The declaration is guarded against relaunch.
+The [independent CK build comparison](chonk-ck-attention-bwd-compare-i910bfcf936d3/experiment.toml) records two cold object identities on one node with four GPUs visible, then verifies private-copy reuse of each qualified build in a fresh process.
+Job `762221` passed: both same-node builds had the same key and size but different SHA-256 digests, and both verified copies were reused without a rebuild.
+The declaration is guarded against relaunch, and the full-layout prewarm gate remains unchanged.
+The separate [node-verified full-layout retest](chonk-native-fnuz-ck-node-verified-i910bfcf936d3/experiment.toml) qualifies each node's cold build in a fresh warm process and verifies that node's exact bytes in its four private rank caches before testing the same matched P2P boundary.
+Job `762323` qualified all 16 node builds and cleared the matched call-8 boundary, but later native forward dispatch timeouts on stage-2 call 10 and stage-3 call 9 prevented any update from completing.
+The declaration is guarded against relaunch, and full-layout fit remains unverified.
+The [later P2P diagnostic](chonk-native-fnuz-later-p2p-trace-i910bfcf936d3/experiment.toml) adds matched native forward-9, forward-8 and backward-2 observations and GPU markers at both later dispatches, without changing the workload, CK prewarm or deadlines.
+Job `762353` recorded the stage-1 forward-9 send after the stage-2 timeout, while stage 3's later forward receive had already completed on GPU when its own dispatch timed out.
+No update completed, and the declaration is guarded against relaunch.
+The [later phase diagnostic](chonk-native-fnuz-later-phase-trace-i910bfcf936d3/experiment.toml) adds bounded stage-1 host and compiler timing and final-stage loss-backward, stream-wait and reverse-BF16 markers without changing the workload or deadlines.
+Job `762390` localized the late send to long MLP and attention backward host spans, and the final-stage GPU wait to the reverse BF16 dispatch boundary after loss backward and receive completion.
+No update completed, and the declaration is guarded against relaunch.
+The [BF16 event-order component](chonk-bf16-event-order-i910bfcf936d3/experiment.toml) compares native current-stream event capture before versus after gated BF16 materialization, with a contiguous no-copy control.
+The check was submitted once as job `762498` with an explicitly approved one-node overlap with profiling job `762400`, and is guarded against relaunch.
+Job `762498` passed: capture before the copy let the consumer marker complete early, capture after the copy held it, and every payload was exact after release.
+The component establishes the local ordering gap, not the cause of the full-layout stall.
+The [EP16 follow-up](chonk-bf16-event-order-ep16-i910bfcf936d3/experiment.toml) verifies gated capture-after-copy in native cached BF16 dispatch with two outstanding FNUZ routing handles, an ungated contiguous control, and exact BF16 and FP32 reverse-combine checks.
+It was submitted once as job `762588` under the normal node cap and is guarded against relaunch; it does not run Megatron or read a held payload.
+Job `762588` passed all 32 rank-handle cases on native CXI: gated completion stayed pending until release, and the BF16 and FP32 results were exact.
+The component does not establish that the training gradient required materialization or that the event ordering explains the full-layout timeout.
+The [Megatron EP16 regression](chonk-native-fnuz-reverse-ready-ep16-i910bfcf936d3/experiment.toml) pins verified signed `041c1d753028e4190efb342accb98a6f362ee7dd` and exercises actual `FusedCombine.backward` with both gradient layouts.
+Job `762600` passed all 48 exact cases across 16 native CXI ranks via actual Megatron autograd; Slurm completed in 1:11 with exit `0:0`, and no shared cache was published.
+The component is guarded against relaunch and does not establish full-layout fit.
+The separate [guarded full-layout retest](chonk-native-fnuz-reverse-ready-i910bfcf936d3/experiment.toml) now clears the Megatron EP16 prerequisite and adds observations of the final-stage BF16 gradient layout, stage-1 receive, and first FC2 dgrad.
+The [exact 16-node launch](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#signed-full-layout-reverse-readiness-retest-exact-launch-review) was reviewed against frozen `762390` and submitted once as job `762603` in `cscs`.
+Job `762603` cleared call 8 but reproduced both later native dispatch timeouts with no completed update.
+The final-stage BF16 gradient was already contiguous on all ranks, and the stage-1 host trace narrowed a 207–208 s gap to before the first FC2 dgrad launch.
+The [failed run and traces](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#762603-result-the-signed-readiness-fix-did-not-clear-the-full-layout-timeout) are retained and guarded against relaunch; full-layout fit remains unverified.
+The [guarded full-layout stall trace](chonk-native-fnuz-stall-trace-i910bfcf936d3/experiment.toml) splits stage-1 MLP autograd and expert input preparation, and brackets final-stage producer readiness, cached internode dispatch, and the existing consumer wait.
+The [exact launch](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#full-layout-stalled-phase-diagnostic-exact-launch-review) preserves the signed source, workload, and deadlines and was submitted once as job `764472`; the guard is restored.
+Job `764472` located a 194.92–198.21 s stage-1 gap after layernorm recompute and before resident-expert backward, but timed out at final-stage call 8 before the new call-9 reverse trace.
+The [retained result](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#764472-result-stage-1-gap-precedes-resident-backward-final-stage-call-8-timed-out) records the late matching send despite verified CK prewarm and no completed update.
+The [guarded handoff trace](chonk-native-fnuz-handoff-trace-i910bfcf936d3/experiment.toml) observes actual stage-1 unpermute and resident autograd nodes and the stage-2 call-8 sender's schedule and callbacks.
+The [exact full-layout launch](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#full-layout-autograd-handoff-and-call-8-sender-exact-launch-review) was approved and submitted once as job `764539`; the one-shot guard is restored.
+Job `764539` cleared call 8 and located the stage-1 delay inside TE's permutation helper (192.67–195.50 s host time), not the subsequent autograd handoff.
+It reproduced both later dispatch timeouts and completed no update; the [retained result](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#764539-result-stage-1-host-delay-is-inside-te-permutation-later-timeouts-recur) separates these observations from the still-unverified cause.
+The [600-second host-timeout diagnostic](chonk-native-fnuz-timeout600-i910bfcf936d3/experiment.toml) retains the `764539` full workload and outer deadlines, and samples the existing stage-2 and stage-3 GPU markers during the longer UCCL host wait.
+The [exact launch](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#full-layout-600-second-uccl-host-timeout-exact-launch-review) was approved and submitted once as job `764642`; the one-shot guard is restored.
+In the [interim trace](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#764642-interim-observation-both-dispatches-cleared-after-the-old-cutoff), both previously failing dispatches returned after about 120–122 seconds and their GPU dependencies completed on all ranks; there was not yet a full-update verdict.
+The [late backward drain failed](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#764642-outcome-late-backward-drain-failed-after-both-dispatches-recovered) with HSA queue faults and a rank-60 child SIGKILL; no update completed and an OOM kill was not confirmed.
+The [24-layer backward-drain control](chonk-reduced24-native-fnuz-drain-i910bfcf936d3/experiment.toml) keeps the `764642` timeout, batch, parallel degrees and mitigations, with depth reduced and the final backward and optimizer boundaries traced.
+Its [exact launch](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#24-layer-backward-drain-control-exact-launch-review) was approved and submitted once as job `764651`; the guard is restored.
+The [reduced 24-layer dense-head fit probe](chonk-reduced24-native-fnuz-dense-fit-i910bfcf936d3/experiment.toml) keeps the original full batch and parallel degrees but uses the signed source before output chunking and FC1 replay.
+Job `760023` failed the startup GPU identity rendezvous before training; reduced-model fit was not tested.
+It is guarded against relaunch and cannot establish full Chonk fit.
+The [GPU identity startup-only diagnostic](chonk-reduced24-startup-trace-i910bfcf936d3/experiment.toml) times the same startup phases and stops before training, without increasing the 300-second rendezvous deadline.
+Job `760046` passed startup on all 64 ranks; the prior multi-minute skew did not recur and reduced-model fit remains untested.
+It is guarded against relaunch.
+The [cached-image reduced fit probe](chonk-reduced24-native-fnuz-cached-fit-i910bfcf936d3/experiment.toml) preserves `760023`'s signed 24-layer workload and deadlines, stages the verified image locally, and retains startup tracing through training.
+The [exact `cscs` launch](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#cached-image-24-layer-dense-head-fit-exact-launch-review) was approved and submitted once as job `762626`; the one-shot guard is restored.
+Job `762626` cleared startup and the first unchunked dense head on every final-stage rank, then timed out in final-stage call 8 before any update completed.
+No OOM was logged; the [retained evidence](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md#762626-result-first-dense-head-passed-final-stage-call-8-timed-out) does not establish reduced- or full-model fit.
+The [execution record](chonk-swissai-resident-fnuz-i910bfcf936d3/EXECUTION.md) tracks accepted component evidence and the rehearsal review separately from the still-unqualified full-layout fit, restart, cache reuse, and throughput.
+The earlier inputs and measurements below are historical and unchanged.
+
 ## KDA Chonk baseline: primary target
 
 [moe-chonk-kda-m1072583a9632-icb5a384016a9](moe-chonk-kda-m1072583a9632-icb5a384016a9/experiment.toml) uses the full trained model geometry: 42 layers with three leading dense layers, hidden size 3584, dense FFN 17280, and 256 routed experts/top-8 with expert/shared FFN 1920 and latent size 1792.

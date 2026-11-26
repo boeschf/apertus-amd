@@ -1,0 +1,25 @@
+# One gfx942 rank; dense-vs-chunked output/CE arithmetic and allocator peaks.
+nodes = 1
+entrypoint = "tests/test_utils/python_scripts/qualify_chunked_lm_head.py"
+args = ["--device", "cuda"]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "aee1e9abab07e644653f71da98e35835059de10d"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "4"
+MAX_JOBS = "8"
+TORCHINDUCTOR_COMPILE_THREADS = "4"
+TORCH_COMPILE_DISABLE = "0"
+TORCH_CPP_LOG_LEVEL = "WARNING"
+
+[procedure]
+kind = "probe"
+timeout = 900
+launch_blocked = "One-shot actual-shape component submitted as job 759658; no further launch is authorized."

@@ -1,0 +1,25 @@
+# One gfx942 rank: native replay trace, lifecycle, and retained-allocation comparison.
+nodes = 1
+entrypoint = "tests/test_utils/python_scripts/qualify_resident_fnuz_experts.py"
+args = ["--recompute-fc1", "--trace-dir", "/apertus/output/expert-traces"]
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "4c34a4238fd22f2ea033b95b044a4087b4bf56a1"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+OMP_NUM_THREADS = "4"
+MAX_JOBS = "8"
+TORCHINDUCTOR_COMPILE_THREADS = "4"
+TORCH_COMPILE_DISABLE = "0"
+TORCH_CPP_LOG_LEVEL = "WARNING"
+
+[procedure]
+kind = "probe"
+timeout = 900
+launch_blocked = "One-shot FC1 replay GPU component submitted as job 759931; no further launch is authorized."

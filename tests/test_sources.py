@@ -1,6 +1,7 @@
 """Committed-source preparation, integrity checking, and safe extraction."""
 
 import io
+import json
 from pathlib import Path
 import subprocess
 import tarfile
@@ -36,6 +37,12 @@ def test_source_uses_committed_bytes_with_no_origin_or_history_copy(tmp_path, mo
     assert sources.prepare(selection, tmp_path / "sources", local=repository) == record
     (directory / "source.tar").write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="checksum"):
+        sources.prepare(selection, tmp_path / "sources", local=repository)
+    manifest = directory / "manifest.json"
+    altered = json.loads(manifest.read_text())
+    altered["tree"] = "changed-tree"
+    manifest.write_text(json.dumps(altered))
+    with pytest.raises(ValueError, match="commit/tree mismatch"):
         sources.prepare(selection, tmp_path / "sources", local=repository)
 
 

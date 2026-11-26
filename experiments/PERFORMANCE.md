@@ -39,7 +39,7 @@ Dependencies between patches must be recorded; an environment variable with no c
 The user-supplied Chonk patch directory is `/iopsstor/scratch/cscs/boeschf/amd-vs-gh200-moe-training/chonk/patches/`.
 Audit patches individually against the selected source and installed vendor APIs; a clean apply-check does not verify helper destinations, numerical behavior or dependencies.
 Prefer an existing supported backend selector over importing a custom autograd/backend bundle when it isolates the same hypothesis.
-Keep compatibility fixes separate from performance arms, retain default-off source backports and require immutable base-plus-patch provenance before execution.
+Keep compatibility fixes separate from performance arms, retain default-off source backports and pin the exact Megatron commit and source archive before execution.
 Keep compiler policy fixed while testing each optimization, then revisit compilation if a custom kernel replaces a compiled path.
 FP8 dispatch, changed recomputation, and alternate attention kernels need numerical checks appropriate to the change.
 Historical tuning tables from Torch 2.10/Triton 3.6 must not be assumed valid on our Torch 2.14/Triton 3.8 image.
@@ -146,7 +146,7 @@ Packaging several individually confirmed winners later does not make their combi
 During execution, provide approximately five-minute progress updates grouped by these workstreams and report failures or blockers sooner.
 Updates distinguish submitted/running work, measured GPU outcomes, CPU-only checks, image build/publication status and remaining dependencies.
 Use disjoint exclusive allocations for independent GPU tests; do not borrow or disturb unrelated jobs.
-The `cscs` reservation and general `mi300` may run concurrently, with at most 16 investigation nodes in each pool.
+The `cscs` reservation and general `mi300` may run concurrently on disjoint allocations, with at most 16 investigation nodes total across both pools.
 Reuse a node set for paired small-gain measurements when practical, without delaying work for ideal nodes.
 Do not run intrusive allocation-based memory probes or unrelated GPU tuning on benchmark nodes concurrently with training.
 Refresh lightweight node observations before runs and periodically when scheduler access permits, but do not require a clean-node threshold or retroactive reruns.
@@ -213,11 +213,12 @@ This plan does not itself submit GPU jobs or grant unlimited allocations or retr
 | C1: SSSGLU | Diagnose weighted-reference compiler specialization without changing the activation patch initially. | Specialization ledger, source-supported cause and corrected qualification proposal. | Default compiler-budget qualification before timing; retain all declared numerical and fallback checks. |
 | C2: Q/K norm | Prepare b3-0004 independently of C1 and the negative output gate. | Installed FLA training contract, parameter/state map and default-off numerical proposal. | Full shape/layout/output/input-gradient/parameter-gradient checks and parameter/checkpoint compatibility. |
 | C3: KDA layout | Inventory remaining copies and design a K2 convolution-only candidate separately from G2 padding. | Baseline/candidate copy ledger, exact shape/cast contract and backward cases. | Source/CPU review, then separate native qualification; no dependence on an SSSGLU retry. |
-| D: source execution support | Specify and test immutable base-plus-patch execution without commits or live-checkout imports. | Minimal source-selection extension and CPU failure-path tests, with unchanged commit-only behavior. | Independent review before any patched full-model run; not a prerequisite for committed-source UCCL. |
+| D: patched source selection | Use an isolated Megatron branch for separately reviewed patches and pin the full resulting commit. | Use the existing commit-only archive and runtime; retain patch provenance and keep the custom source runner prototype parked. | Review the exact delta and native component evidence before any patched full-model run; not a prerequisite for committed-source UCCL. |
 | E: pipeline communication | Review the existing overlap consumer and isolate the even-PP communicator-split hypothesis. | Consumer/endpoint/lifetime map and a default-off PP4/VPP2 test proposal. | Separate schedule correctness and completion checks; no bundled EP/backend or wait-removal changes. |
 
 Use parallel CPU preparation freely within these ownership boundaries.
-Use `cscs` for ready component jobs while full-model training uses general `mi300`, within the separate 16-node limits.
+Use `cscs` for ready component jobs and general `mi300` for full-model training, subject to the combined 16-node cap.
+A 16-node training allocation leaves no capacity for a concurrent investigation GPU job; CPU work may continue in parallel.
 Keep the two matched training arms sequential and never share benchmark GPUs, private caches or mutable source trees between tracks.
 If nodes or review capacity are limited, prioritize UCCL training, then the first qualified GEMM or activation component.
 The coordinator reports progress about every five minutes during execution and reports blockers sooner.
@@ -301,16 +302,15 @@ Do not combine KDA padding, recompute removal, tile changes and convolution fusi
 The b3-0003 internal KDA recompute option is a separate memory/performance alternative; it does not remove outer `linear_attn` checkpointing and needs installed-API and saved-state memory review.
 Do not port k6 chunked-convolution private APIs in this wave.
 
-### D: immutable patch execution
+### D: use pinned commits from an experiment branch
 
-The current source runner freezes commits only, so staged patch files are not yet an executable full-model patch stack.
-Add only the concrete support needed to select an exact base commit plus explicit ordered patch assets and verify the resulting archive/file manifest.
-Keep preparation in an owned export; preserve external repositories and prohibit commits, live-source mounts and silent patch discovery.
-Use the same resolver and runtime path for planning, existing allocations and batch execution, with read-only/no-subprocess planning preserved.
-Test missing/wrong-base patches, failed application, reordered assets, path escape, partial preparation, changed archive/file hashes and wrong runtime import origin.
-Preserve the unpatched source mode and retain both input patch bytes and resulting source identity.
-For a source-kernel comparison, run the same patched snapshot in both arms with its default-off selector changed explicitly, so source identity is not an extra uncontrolled difference.
-Do not rebuild the image merely to test a default-off Python backport if this reviewed source path is sufficient.
+Prefer a local experiment branch based on the exact tested e242 commit over a new base-plus-patch runner mode.
+Keep the original checkout and historical tooling intact; use a separate worktree for any explicitly approved branch changes, with one isolated commit per reviewed patch and compatibility fixes recorded separately.
+Pin the full resulting commit in the experiment, not the movable branch name, and let the existing runner freeze its source archive and mount it read-only.
+Retain the original patch bytes, branch-base commit, exact resulting delta and runtime import evidence.
+For a source-kernel comparison, run both arms from the same pinned commit and change only its default-off selector.
+Keep image 910 and its vendor packages fixed; no image rebuild, external merge, or push is needed for the experiment.
+Do not include negative or unqualified candidates in a tested branch just to assemble the patch stack.
 
 ### E: pipeline communication and later optimizer work
 
@@ -327,7 +327,8 @@ Existing communication warmup consumers must not be duplicated.
 
 ### Release and stop rules
 
-Each GPU proposal requires focused CPU checks, explicit experiment inputs, immutable source/image/tooling identity, fresh placement review and a bounded resource approval.
+Each GPU proposal requires focused CPU checks, explicit experiment inputs, immutable source/image/tooling identity, fresh placement review and bounded resources.
+The user grants standing approval for in-scope runs within the combined 16-node cap; check existing and pending investigation requests before submission to prevent excess overlap.
 Give each component proposal a stated case count, numerical/compiler requirements, timing schedule, success rule and maximum attempts before using GPUs.
 New failures stop that candidate for review; independent ready tracks may continue without automatic retries or budget growth.
 After a component win, test the real import/dispatch, recomputation and parameter/checkpoint behavior, then run a separate full-model comparison.

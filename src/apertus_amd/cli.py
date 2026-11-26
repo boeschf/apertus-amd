@@ -43,10 +43,13 @@ def main() -> None:
         parser.add_argument("--" + flag, type=int)
     parser.add_argument("--time")
     parser.add_argument("--reservation", help="optional Slurm reservation for a new allocation")
+    parser.add_argument("--exclude", help="comma-separated node names to exclude from a new allocation")
     parser.add_argument("--dependency", help="batch dependency: afterany:JOB_ID or afterok:JOB_ID")
     parser.add_argument("--cpu-bind")
     parser.add_argument("--distribution", help="Slurm block:<within-node policy>; defaults to the site setting")
     parser.add_argument("--cache-mode", choices=("auto", "cold", "warm"), default="auto")
+    parser.add_argument("--cache-image", action="store_true",
+                        help="stage or verify the pinned SquashFS under ./cache/images before launching")
     parser.add_argument("--compare-run", type=Path, help="compare validation results against a retained run")
     args = vars(parser.parse_args())
     command, experiment, checkout = (args.pop(name) for name in ("command", "experiment", "checkout"))

@@ -74,6 +74,7 @@ def prepared(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
     (source / "source.tar").write_bytes(b"fixture")
+    write_json(source / "manifest.json", {"files": {"pretrain_gpt.py": "file-sha"}})
     monkeypatch.setattr(sources, "prepare", lambda *a, **k: {
         "directory": str(source), "sha256": "source-sha", "tree": "git-tree", "files": {"pretrain_gpt.py": "file-sha"}})
     monkeypatch.setattr(runs, "image_manifest", lambda *a, **k: {})
@@ -130,6 +131,45 @@ def test_batch_is_thin_and_submitted_once(prepared, tmp_path, monkeypatch, reser
     assert ("#SBATCH --dependency=afterany:98765" in script) == bool(dependency)
     assert "#SBATCH --uenv-passthrough=ignore" in script
     assert "apertus_amd.runs" in script and "--num-layers" not in script
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_cached_image_is_verified_before_submission(prepared, tmp_path, monkeypatch, valid):
+    source = tmp_path / "registry" / "image.sqsh"
+    source.parent.mkdir()
+    source.write_bytes(b"expected")
+    digest = sha256(source)
+    write_json(source.parent / "manifest.json", {
+        "schema": 1, "artifacts": {"image.sqsh": {"sha256": digest, "bytes": source.stat().st_size}},
+    })
+    if not valid:
+        source.write_bytes(b"tampered")
+    target = tmp_path / "cache/images/sha256" / digest / "image.sqsh"
+    prepared["launch"] = {"submit": True, "job_id": None}
+    prepared.update(image={**prepared["image"], "sha256": digest}, image_path=str(target),
+                    registry_image_path=str(source))
+    calls = []
+
+    def submit(command, **kwargs):
+        calls.append(command)
+        directory = Path(command[-1]).parent
+        assert sha256(target) == digest
+        assert tomllib.loads((directory / "container.toml").read_text())["image"] == str(target)
+        frozen = json.loads((directory / "resolved.json").read_text())
+        assert frozen["image_path"] == str(target) and frozen["registry_image_path"] == str(source)
+        return subprocess.CompletedProcess(command, 0, stdout="12345\n")
+
+    monkeypatch.setattr(subprocess, "run", submit)
+    if valid:
+        runs.run(prepared, tmp_path)
+        assert len(calls) == 1
+    else:
+        with pytest.raises(ValueError, match="invalid cached image"):
+            runs.run(prepared, tmp_path)
+        assert not calls and not target.exists()
+        [directory] = (Path(prepared["data_root"]) / "runs" / prepared["experiment"]).iterdir()
+        assert json.loads((directory / "result.json").read_text())["status"] == "failed"
+    assert not list(target.parent.glob(".image.sqsh-*"))
 
 
 def test_ambiguous_submission_is_retained_and_never_retried(prepared, tmp_path, monkeypatch):

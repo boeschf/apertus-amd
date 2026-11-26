@@ -1,7 +1,7 @@
 """Slurm rank lifecycle: node preparation, private caches, explicit trials, and collection."""
 
 import ctypes
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -13,9 +13,9 @@ import sys
 import threading
 import time
 
-from . import cache
+from . import cache, memory_telemetry
 from .artifacts import sha256, write_json
-from .config import CACHE_PATHS, phases
+from .config import CACHE_PATHS, phases, require_launchable
 from .sources import extract
 
 
@@ -161,14 +161,30 @@ def stop_child(process: subprocess.Popen) -> None:
 
 
 def child(command: list[str], log: Path, *, cwd: Path, env: dict, timeout: float | None = None,
-          session: Path | None = None) -> None:
+          session: Path | None = None, telemetry: Path | None = None, telemetry_mappings: bool = False) -> None:
     """Monitor a bounded child and peer failures; stop its group before returning."""
-    with log.open("w") as stream:
+    observation = telemetry.open("x") if telemetry is not None else nullcontext()
+    with observation as samples, log.open("w") as stream:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.monotonic() + timeout if timeout is not None else None
+        next_sample = 0.0
+        next_mapping = 0.0
+
+        def record(event):
+            nonlocal next_mapping
+            if samples is not None:
+                mappings = telemetry_mappings and event == "live" and time.monotonic() >= next_mapping
+                memory_telemetry.sample(samples, process.pid, node_lead=env["LOCAL_RANK"] == "0", event=event,
+                                        mappings=mappings)
+                if mappings:
+                    next_mapping = time.monotonic() + 10.0
+
         try:
             while True:
+                if samples is not None and time.monotonic() >= next_sample:
+                    record("live")
+                    next_sample = time.monotonic() + 5.0
                 if session is not None:
                     peer_failure(session)
                 remaining = deadline - time.monotonic() if deadline is not None else 0.1
@@ -179,6 +195,13 @@ def child(command: list[str], log: Path, *, cwd: Path, env: dict, timeout: float
                     break
                 except subprocess.TimeoutExpired:
                     continue
+            record(f"exit:{status}")
+        except BaseException as error:
+            try:
+                record(f"interrupted:{type(error).__name__}")
+            except Exception as sample_error:
+                error.add_note(f"memory telemetry: {sample_error}")
+            raise
         finally:
             # A successful leader can also leave helpers alive and writing caches.
             # Defer repeated scheduler signals until teardown has finished.
@@ -208,10 +231,18 @@ def wait(paths: list[Path], session: Path, timeout: float, *, errors: bool = Tru
         time.sleep(0.1)
 
 
-def exchange(session: Path, name: str, rank: int, world: int, value: dict, timeout: float) -> list[dict]:
+def exchange(session: Path, name: str, rank: int, world: int, value: dict, timeout: float,
+             *, trace=None) -> list[dict]:
     """Publish one rank record and require contributions from every expected rank."""
+    if trace:
+        trace("identity_write_begin")
     write_json(session / f"{name}-{rank}.json", value)
-    return wait([session / f"{name}-{r}.json" for r in range(world)], session, timeout)
+    if trace:
+        trace("identity_wait_begin", timeout_seconds=timeout)
+    result = wait([session / f"{name}-{r}.json" for r in range(world)], session, timeout)
+    if trace:
+        trace("identity_wait_end")
+    return result
 
 
 def rank_environment(environ: dict, visible_gpus: int) -> dict:
@@ -290,6 +321,13 @@ def verify_tooling(run: Path, settings: dict) -> None:
         raise ValueError("frozen validation script changed")
 
 
+def verify_source_manifest(mounted_source: Path, settings: dict) -> None:
+    """Check the mounted manifest against the value frozen by the submitter."""
+    expected = settings.get("source_snapshot", {}).get("manifest_sha256")
+    if expected and sha256(mounted_source / "manifest.json") != expected:
+        raise ValueError("frozen source manifest changed")
+
+
 def training_command(settings: dict, output: Path, source: Path, extra_args: list[str]) -> list[str]:
     """Select ordinary source execution or the experiment's explicit validation wrapper."""
     wrapper = ["/apertus/validation.py", "train"] if settings["validation"] else ["-m", "apertus_amd.entrypoint"]
@@ -352,7 +390,11 @@ def complete(settings: dict, run: Path, output: Path, session: Path, *, rank: in
             if any(item["errors"] for item in gathered):
                 raise ValueError(f"rank cache capture failed: {[item['errors'] for item in gathered]}")
             bundles = [path for item in gathered for path in item["bundles"]]
-            if bundles:
+            if settings.get("procedure", {}).get("kind") == "probe":
+                if bundles:
+                    raise ValueError("probe unexpectedly supplied publishable cache bundles")
+                result["cache"]["publication"] = "not applicable (probe)"
+            elif bundles:
                 request = session / "publication-request.json"
                 write_json(request, {"root": str(run / "cache"), "descriptor": result["cache"]["descriptor"],
                                      "bundles": bundles, "max_bytes": settings["cache"]["max_gb"] * 2**30,
@@ -441,6 +483,16 @@ def finalize(run: Path, output: Path, session: Path, scratch: Path, owner: dict,
 
 def main() -> None:
     """Execute one Slurm task; rank zero collects checks and publishes all-rank additions."""
+    stamp = time.monotonic_ns()
+    startup_trace = sys.argv[1:2] == ["--startup-trace"]
+
+    def trace(event, **detail):
+        if startup_trace:
+            print("APERTUS_STARTUP " + json.dumps(dict(
+                event=event, rank=int(os.environ["SLURM_PROCID"]), node=int(os.environ["SLURM_NODEID"]),
+                unix_ns=time.time_ns(), elapsed_ns=time.monotonic_ns() - stamp, **detail,
+            ), separators=(",", ":")), file=sys.stderr, flush=True)
+
     def interrupted(signum, frame):
         raise InterruptedError(f"signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
@@ -460,7 +512,14 @@ def main() -> None:
         publication_worker(Path(sys.argv[2]))
         return
     run, output = Path("/apertus"), Path("/apertus/output")
+    trace("python_settings_begin")
     settings = json.loads((run / "resolved.json").read_text())
+    require_launchable(settings)
+    procedure = settings["procedure"]
+    startup_only = procedure.get("startup_only", False)
+    if (startup_only or procedure.get("startup_trace", False)) != startup_trace:
+        raise ValueError("startup trace invocation differs from frozen procedure")
+    trace("python_settings_end")
     rank, world = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
     local, node = int(os.environ["SLURM_LOCALID"]), int(os.environ["SLURM_NODEID"])
     env = dict(os.environ, **settings["environment"])
@@ -477,6 +536,7 @@ def main() -> None:
         native_command(settings, output, index, rank, env)
         return
     ranks_per_node = settings["resources"]["gpus_per_node"]
+    probe = settings["procedure"]["kind"] == "probe"
     session = output / ".runtime"
     session.mkdir(exist_ok=True)
     timeout = settings["cache"]["timeout"]
@@ -487,37 +547,69 @@ def main() -> None:
     status = {"status": "failed", "rank": rank, "node": node}
     result = {"status": "failed"}
     affinity = {}
+    startup_validated = False
     try:
+        trace("tooling_verify_begin")
         verify_tooling(run, settings)
+        trace("source_manifest_verify_begin")
+        verify_source_manifest(run / "source", settings)
+        trace("verification_end")
         if world != settings["resources"]["nodes"] * ranks_per_node:
             raise ValueError("Slurm task count differs from planned layout")
         if settings["launch"]["job_id"] and owner["job_id"] != settings["launch"]["job_id"]:
             raise ValueError("allocation differs from selected job")
+        trace("environment_write_begin")
         record_environment(output, rank, node, env)
+        trace("environment_write_end")
         try:
             with preserve_affinity(affinity) as initial_affinity:
+                trace("torch_import_begin")
                 import torch
-                env = dict(os.environ, **settings["environment"], **rank_environment(os.environ, torch.cuda.device_count()))
+                trace("device_count_begin")
+                visible_gpus = torch.cuda.device_count()
+                trace("device_count_end", visible_gpus=visible_gpus)
+                env = dict(os.environ, **settings["environment"], **rank_environment(os.environ, visible_gpus))
+                trace("device_select_begin", local_rank=local)
                 torch.cuda.set_device(local)
+                trace("device_select_end")
+                trace("device_properties_begin")
                 gpu = torch.cuda.get_device_properties(local)
+                trace("device_properties_end", target=gpu.gcnArchName)
         finally:
             # Keep startup/restoration failures even when no GPU rank record is possible.
+            trace("affinity_first_write_begin")
             write_json(output / f"affinity-{rank}.json", affinity)
+            trace("affinity_first_write_end")
         cpus = str(len(initial_affinity))
         affinity["thread_defaults"] = {"captured_cpu_count": len(initial_affinity),
                                       "explicit": {k: env[k] for k in ("OMP_NUM_THREADS", "MAX_JOBS") if k in env}}
         env.setdefault("OMP_NUM_THREADS", cpus)
         env.setdefault("MAX_JOBS", cpus)
         affinity["thread_defaults"]["effective"] = {k: env[k] for k in ("OMP_NUM_THREADS", "MAX_JOBS")}
+        trace("affinity_final_write_begin")
         write_json(output / f"affinity-{rank}.json", affinity)
+        trace("affinity_final_write_end")
         descriptor = {"format": cache.SCHEMA, "adapter": 3, "image": settings["image"]["sha256"],
                       "source": settings["source_snapshot"]["sha256"], "gpu": gpu.gcnArchName,
                       "environment": settings["environment"], "prepare": settings["prepare"]}
-        identities = exchange(session, "identity", rank, world, {"key": cache.identity(descriptor)}, timeout)
+        if probe:
+            descriptor["procedure"] = "probe"
+        identity_timeout = settings["procedure"].get("gpu_identity_timeout", timeout)
+        identities = exchange(session, "identity", rank, world, {"key": cache.identity(descriptor)}, identity_timeout,
+                              **({"trace": trace} if startup_trace else {}))
         if len({item["key"] for item in identities}) != 1:
             raise ValueError("ranks disagree on cache compatibility")
+        startup_validated = True
+        trace("startup_identity_validated", target=gpu.gcnArchName)
+        if startup_only:
+            status.update(status="passed", target=gpu.gcnArchName, affinity=affinity)
+            result.update(status="passed", execution="startup only",
+                          checks="all runtime GPU identities agree; no training",
+                          cache={"publication": "not applicable (startup only)"})
+            return  # Finalize collectively; do not select a cache or stage scratch.
         if rank == 0:
-            selection = choose_generation(run / "cache", descriptor, settings["cache"]["mode"])
+            selection = choose_generation(run / "cache", descriptor,
+                                          "cold" if probe else settings["cache"]["mode"])
             with socket.socket() as rendezvous:
                 rendezvous.bind(("", 0))
                 selection.update(address=socket.gethostname(), port=rendezvous.getsockname()[1])
@@ -594,9 +686,15 @@ def main() -> None:
             if rank == 0:
                 write_json(directory / "command.json", {"argv": command, "environment": {
                     k: phase_env[k] for k in {*settings['environment'], *CACHE_PATHS, "OMP_NUM_THREADS", "MAX_JOBS"}}})
-            require_affinity(initial_affinity, "training child")
-            child(command, directory / f"rank-{rank}.log", cwd=source, env=phase_env, session=session)
+            require_affinity(initial_affinity, "probe child" if probe else "training child")
+            child(command, directory / f"rank-{rank}.log", cwd=source, env=phase_env,
+                  timeout=settings["procedure"]["timeout"] if probe else None, session=session,
+                  **({"telemetry": directory / f"host-memory-rank-{rank}.jsonl",
+                      "telemetry_mappings": rank in settings["procedure"].get("memory_mapping_ranks", [])}
+                     if settings["procedure"].get("memory_telemetry") else {}))
             exchange(session, name + "-exited", rank, world, {"exited": True}, timeout)
+            if probe:
+                continue  # Diagnostic JIT artifacts are not eligible for publication.
             try:
                 helpers = payload / "helpers"
                 helpers.mkdir(exist_ok=True)
@@ -624,6 +722,8 @@ def main() -> None:
         status["status"] = "passed"
     except BaseException as error:
         status["error"] = str(error)
+        if startup_trace and not startup_validated:
+            trace("startup_error", error=str(error).split("\n", 1)[0][:4096])
         if affinity:
             status["affinity"] = affinity
         if isinstance(error, UnreapedChildError):
@@ -632,6 +732,9 @@ def main() -> None:
     finally:
         result = finalize(run, output, session, scratch, owner, rank=rank, world=world, local=local,
                           ranks_per_node=ranks_per_node, timeout=timeout, status=status, result=result)
+        # A locally successful startup may still fail another rank's finalization.
+        if startup_only and status["status"] == "passed" and result["status"] != "passed":
+            raise RuntimeError("startup finalization failed; see result.json")
     if result["status"] != "passed":
         raise RuntimeError("rank finalization failed; see result.json")
 

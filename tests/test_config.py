@@ -7,6 +7,7 @@ import pytest
 
 from apertus_amd import config
 from apertus_amd.cli import plan
+from apertus_amd.runs import batch_script
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,19 @@ def test_plan_uses_full_node_defaults_without_subprocesses(monkeypatch):
     assert result["step"][0] == "srun" and "torchrun" not in str(result)
     assert result["environment"]["NVTE_FLASH_ATTN"] == "1"
     assert result["phases"][1]["extra_args"][-2:] == ["--exit-interval", "2"]
+
+
+def test_image_cache_plan_changes_only_image_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    kwargs = {"job_id": "123", "site": ROOT / "config.toml"}
+    original = plan(EXPERIMENT, **kwargs)
+    selected = plan(EXPERIMENT, cache_image=True, **kwargs)
+    assert selected == {
+        **original,
+        "image_path": str(tmp_path / "cache/images/sha256" / original["image"]["sha256"] / "image.sqsh"),
+        "registry_image_path": original["image_path"],
+    }
+    assert not (tmp_path / "cache").exists()
 
 
 def test_resource_overrides_and_procedure_preserve_explicit_arguments():
@@ -49,6 +63,20 @@ def test_dependency_is_retained_only_for_batch_submission(dependency):
 def test_invalid_dependency_is_rejected(dependency):
     with pytest.raises(ValueError, match='dependency requires batch'):
         config.resolve(EXPERIMENT, submit=True, dependency=dependency)
+
+
+def test_exclude_is_frozen_and_forwarded_to_batch():
+    value = config.resolve(EXPERIMENT, submit=True, exclude="nid002450")
+    assert value["resources"]["exclude"] == "nid002450"
+    assert "#SBATCH --exclude=nid002450\n" in batch_script({**value, "id": "test"}, Path("/run"))
+    with pytest.raises(ValueError, match="exclude requires batch"):
+        config.resolve(EXPERIMENT, job_id="123", exclude="nid002450")
+
+
+@pytest.mark.parametrize("exclude", ["", "-nid002450", "nid002450,", "nid002450\n#SBATCH --nodes=64"])
+def test_invalid_exclude_is_rejected(exclude):
+    with pytest.raises(ValueError, match="exclude requires batch"):
+        config.resolve(EXPERIMENT, submit=True, exclude=exclude)
 
 
 def test_node_count_precedence_in_plans(tmp_path, monkeypatch):

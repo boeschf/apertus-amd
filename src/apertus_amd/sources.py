@@ -38,15 +38,17 @@ def prepare(selection: dict, root: Path, *, local: Path) -> dict:
 
     if git("rev-parse", f"{commit}^{{commit}}", text=True).stdout.strip() != commit:
         raise ValueError("resolved Git commit differs from requested identity")
+    tree = git("rev-parse", f"{commit}^{{tree}}", text=True).stdout.strip()
     with exclusive(root / f".{commit}.lock"):
         if destination.exists():
             record = json.loads((destination / "manifest.json").read_text())
+            if record["selection"]["commit"] != commit or record["tree"] != tree:
+                raise ValueError("retained source commit/tree mismatch")
             if record["selection"]["excluded_submodules"] != selection.get("excluded_submodules", []):
                 raise ValueError("retained source selection mismatch")
             if sha256(destination / "source.tar") != record["sha256"]:
                 raise ValueError("retained source checksum mismatch")
             return {**record, "directory": str(destination)}
-        tree = git("rev-parse", f"{commit}^{{tree}}", text=True).stdout.strip()
         excluded = {}
         for entry in git("ls-tree", "-rz", commit).stdout.split(b"\0"):
             if not entry:

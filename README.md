@@ -48,6 +48,13 @@ Each experiment selects its published image by SHA-256 in `experiment.toml`.
 The supplied logical store maps to `/capstor/store/cscs/cscs/public/team-ml/apertus-amd-images` in the site configuration.
 To select another published image, update `[image].store` and `[image].sha256` in the experiment and its store path in the site file.
 The expected layout is `<store>/objects/sha256/<sha256>/{image.sqsh,manifest.json,source.tar.gz}`.
+From the checkout, add `--cache-image` to `plan` and `run` to select `cache/images/sha256/<sha256>/image.sqsh` instead.
+Use this only if the checkout is on shared storage accessible to every compute node.
+Before launching, `run` copies a missing image from the registry, checks its SHA-256, and publishes the verified copy without replacing an existing file.
+On a cache hit it verifies the cached bytes without accessing the registry.
+A bad copy stops the launch rather than overwriting the cache or falling back to the registry.
+This option is independent of `--cache-mode`, which controls compiler caches.
+
 Images supply training dependencies; the selected Megatron source is staged separately at runtime.
 The runner explicitly disables CSCS CXI/libfabric and AWS OFI injection so the image's built-in network libraries are used.
 Every generated EDF sets `com.hooks.cxi.enabled = "false"` and `com.hooks.aws_ofi_nccl.enabled = "false"` under `[annotations]`, for all images.
@@ -157,7 +164,17 @@ For image-native commands, omit `-m<source>`; choose a readable workload/variant
 When changing either pin, rename the experiment directory to match; full hashes in `experiment.toml` remain authoritative.
 It owns the intended `nodes`, source commit, image selection, entry point, native Megatron `args`, environment, preparation commands, and procedure.
 For ordinary training, replace the entire `[procedure]` table with `kind = "train"`.
-This runs the selected entry point through the source-verification wrapper without smoke-test instrumentation or checkpoint comparisons.
+For a new batch allocation, `--exclude nid002450` records the excluded node in the resolved resources and forwards it to `sbatch`.
+
+For a component check in the selected committed source, use `[procedure]` with `kind = "probe"` and a positive `timeout` in seconds.
+It uses the same source snapshot, device selection, rank rendezvous and private caches as training, but does not hydrate or publish shared caches.
+The committed entry point should exit nonzero on failure and print evidence to the per-rank logs.
+By default a probe passes no checkpoint arguments.
+For a fit probe that needs save timing without cache publication, set `checkpoint = true`, supply a `validation` script, and use a final-only synchronous `torch_dist` save (`--save-interval` equal to `--train-iters`).
+The runner supplies the fresh checkpoint directory; inventory and timing do not prove integrity or restoration.
+For a bounded probe, `memory_telemetry = true` appends host memory and process-tree samples to `output/host-memory-rank-*.jsonl` from the training supervisors.
+Node leads also record `/proc/meminfo`, shared-memory usage, and visible memory cgroups.
+An optional `memory_mapping_ranks` list samples the largest resident mappings of the selected training processes, using `/proc/<pid>/smaps` metadata when readable.
 Use `kind = "restart"` with an explicit `split` and `validation` script for restart validation, as in the dense examples.
 For image-native tests, use `kind = "commands"` with explicit command argument arrays and a timeout in seconds, as in the collectives example.
 For source changes, commit them in your Megatron checkout and update `[source].commit`; pushing is not required.

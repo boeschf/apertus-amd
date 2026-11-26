@@ -147,7 +147,8 @@ def worker(tmp_path, monkeypatch, affinity):
     output = run / "output"
     output.mkdir(parents=True)
     state = SimpleNamespace(hook="properties", startup_error=None, drift=None, children=[], statuses=[],
-                            events=[], overrides={}, workload_env=None)
+                            events=[], overrides={}, workload_env=None, startup_only=False, final_result=None,
+                            identity_timeout=None, startup_trace=False)
     # Only the owned scratch tree is real; no GPU, compiler, or workload process runs.
     with tempfile.TemporaryDirectory(prefix="affinity-cpu-test-", dir="/dev/shm") as scratch:
         settings = {"environment": {}, "procedure": {"kind": "training"},
@@ -224,7 +225,7 @@ def worker(tmp_path, monkeypatch, affinity):
 
         def finalize(*args, status, result, **kwargs):
             state.statuses.append(dict(status))
-            return result
+            return result if state.final_result is None else state.final_result
 
         monkeypatch.setattr(runtime, "extract", extract)
         monkeypatch.setattr(runtime, "training_command", command)
@@ -233,6 +234,14 @@ def worker(tmp_path, monkeypatch, affinity):
 
         def execute():
             settings["environment"] = state.overrides
+            if state.startup_only:
+                settings["procedure"] = {"kind": "probe", "startup_only": True, "timeout": 60}
+                monkeypatch.setattr(sys, "argv", ["runtime.py", "--startup-trace"])
+            if state.identity_timeout is not None:
+                settings["procedure"] = {"kind": "probe", "timeout": 60, "gpu_identity_timeout": state.identity_timeout}
+            if state.startup_trace:
+                settings["procedure"]["startup_trace"] = True
+                monkeypatch.setattr(sys, "argv", ["runtime.py", "--startup-trace"])
             (run / "resolved.json").write_text(json.dumps(settings))
             runtime.main()
 
@@ -265,6 +274,81 @@ def test_worker_unchanged_path_never_sets_affinity(worker, affinity):
     record = json.loads((worker.output / "rank-0.json").read_text())
     assert record["affinity"]["initial"] == record["affinity"]["final"] == sorted(BOUND)
     assert not record["affinity"]["restoration_attempted"]
+
+
+@pytest.mark.parametrize("trace", [False, True])
+def test_worker_only_extends_gpu_identity_exchange(worker, monkeypatch, capsys, trace):
+    worker.identity_timeout = 600
+    worker.startup_trace = trace
+    original = runtime.exchange
+    exchanges = []
+
+    def exchange(session, name, rank, world, value, timeout, **kwargs):
+        exchanges.append((name, timeout))
+        return original(session, name, rank, world, value, timeout, **kwargs)
+
+    monkeypatch.setattr(runtime, "exchange", exchange)
+    with pytest.raises(WorkloadReached):
+        worker.run()
+    assert exchanges == [("identity", 600), ("ready", 0.1), ("train-ready", 1)]
+    assert worker.children == [["prepare"], ["training"]]
+    rows = [json.loads(line.removeprefix("APERTUS_STARTUP "))
+            for line in capsys.readouterr().err.splitlines() if line.startswith("APERTUS_STARTUP ")]
+    if trace:
+        assert [r["event"] for r in rows[-3:]] == [
+            "identity_wait_begin", "identity_wait_end", "startup_identity_validated"]
+        assert rows[-3]["timeout_seconds"] == 600
+    else:
+        assert rows == []
+
+
+def test_startup_probe_exits_before_any_training_or_staging(worker, capsys):
+    worker.startup_only = True
+    worker.run()
+    assert worker.children == []
+    assert worker.statuses[0]["status"] == "passed"
+    assert worker.statuses[0]["target"] == "fake arch"
+    session = worker.output / ".runtime"
+    assert {path.name for path in session.iterdir()} == {"identity-0.json"}
+    rows = [json.loads(line.removeprefix("APERTUS_STARTUP "))
+            for line in capsys.readouterr().err.splitlines() if line.startswith("APERTUS_STARTUP ")]
+    assert [row["event"] for row in rows] == [
+        "python_settings_begin", "python_settings_end", "tooling_verify_begin",
+        "source_manifest_verify_begin", "verification_end", "environment_write_begin",
+        "environment_write_end", "torch_import_begin", "device_count_begin", "device_count_end",
+        "device_select_begin", "device_select_end", "device_properties_begin", "device_properties_end",
+        "affinity_first_write_begin", "affinity_first_write_end", "affinity_final_write_begin",
+        "affinity_final_write_end", "identity_write_begin", "identity_wait_begin", "identity_wait_end",
+        "startup_identity_validated",
+    ]
+    assert all(row["rank"] == row["node"] == 0 and row["unix_ns"] > 0 for row in rows)
+    assert [row["elapsed_ns"] for row in rows] == sorted(row["elapsed_ns"] for row in rows)
+    assert rows[-3]["timeout_seconds"] == 0.1
+
+
+def test_startup_probe_preserves_rendezvous_failure_without_training(worker, capsys, monkeypatch):
+    worker.startup_only = True
+    original = runtime.exchange
+
+    def delayed_peer(session, name, rank, world, value, timeout, **kwargs):
+        return original(session, name, rank, world + 1, value, timeout, **kwargs)
+
+    # Keep the fake allocation geometry valid while withholding one identity record.
+    monkeypatch.setattr(runtime, "exchange", delayed_peer)
+    with pytest.raises(TimeoutError, match="identity-1.json"):
+        worker.run()
+    assert worker.children == [] and worker.statuses[0]["status"] == "failed"
+    stderr = capsys.readouterr().err
+    assert "identity_wait_begin" in stderr and "identity_wait_end" not in stderr
+    assert "startup_error" in stderr and "identity-1.json" in stderr
+
+
+def test_startup_probe_propagates_a_peer_finalization_failure(worker):
+    worker.startup_only = True
+    worker.final_result = {"status": "failed"}
+    with pytest.raises(RuntimeError, match="startup finalization failed"):
+        worker.run()
+    assert worker.children == []
 
 
 @pytest.mark.parametrize("overrides,expected", [({}, ("2", "2")), ({"MAX_JOBS": "128"}, ("2", "128")),
