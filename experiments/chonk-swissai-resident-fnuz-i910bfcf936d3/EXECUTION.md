@@ -2324,6 +2324,1220 @@ The pre-submit recheck found no other investigation requests we submitted and 16
 The control was submitted once as job `764651`, and the launch guard is restored.
 The [frozen run](../../artifacts/experiment-data/runs/chonk-reduced24-native-fnuz-drain-i910bfcf936d3/20261126T092801Z-b35edd56/) is retained.
 
+##### `764651` result: the 24-layer control completed one qualified update
+
+Slurm completed the 16-node control in 17:28 with exit `0:0`; the runner and `output/checks.json` both passed on all 64 ranks.
+All 16 nodes qualified their CK objects, all 64 private copies were verified, and all 48 expected training ranks mapped the unchanged object.
+Stage-2 and stage-3 dispatches returned in 96.60–98.25 s and 94.07–94.29 s, respectively, with all traced receive and cached reverse completion markers complete.
+All ranks cleared the final backward drain, gradient finalization, gradient norm preparation, and optimizer step, then recorded one finite, unskipped update.
+All 64 ranks reported gradient norm `2.717410326`; all 16 final-stage ranks reported language-model loss `12.733400345`.
+The observed first-update host span was 859.21–859.36 s per rank, including cold work; this is not a throughput benchmark.
+The minimum sampled node `MemAvailable` during the update was 85.10 GiB on stage 0, 118.77 GiB on stage 1, 140.41 GiB on stage 2, and 128.82 GiB on stage 3.
+No HSA queue fault, OOM, or peer failure was observed, and no checkpoint or shared cache was published.
+This qualifies the 24-layer control only.
+Relative to failed full-depth `764642`, it shows that reducing depth changes the outcome and increases observed headroom, but it does not distinguish memory pressure from other depth-related changes such as timing and layer placement or establish that `764642` OOMed.
+
+##### Offline matched-backward memory and lifetime audit
+
+Read the retained `764642` and `764651` `gpu-progress-rank-*.jsonl` and `host-memory-rank-*.jsonl`; no GPU execution was needed.
+Match `schedule_enter` records by pipeline stage and virtual backward ID (`forward=None`), and check the four ranks per node against the retained rank metadata.
+The ranges below are the minimum and maximum of four node sums per stage in GiB, not simultaneous node measurements or matched physical nodes across runs.
+The two depths also differ in the layers executed at those positions.
+
+| PP stage / backward ID (call) | 42-layer Torch allocated / reserved | 24-layer Torch allocated / reserved |
+| --- | ---: | ---: |
+| 0 / 255 (267) | 84.90–88.53 / 252.89–259.34 | 66.17–69.83 / 199.54–205.48 |
+| 1 / 249 (259) | 222.49–223.79 / 285.87–288.05 | 112.60–113.09 / 154.56–156.33 |
+| 2 / 253 (261) | 161.76–162.97 / 269.58–273.35 | 83.15–83.81 / 143.91–145.31 |
+| 3 / 255 (261) | 125.69–128.82 / 225.18–229.03 | 82.86–86.35 / 154.38–158.12 |
+
+Stage 1 had 97.50–98.20 GiB allocated at full-depth `update_enter` vs 48.66–49.34 GiB in the control; growth from that baseline to backward ID 249 was 124.29–125.70 vs 63.75–64.32 GiB.
+The starting allocation accounts for only about 49 GiB of the roughly 110 GiB tail gap; the rest accumulated during the update and cannot be assigned to a particular owner from these traces.
+At that boundary, the closest stage-1 node samples (within 2.70 s of the node lead's marker) were 0–7.57 GiB available at full depth vs 124.22–138.07 GiB in the control.
+The full-depth stage-1 samples reached zero on two nodes while `/dev/shm` remained near 7.25 GiB.
+`reserved − allocated` on stage 1 was separately 62.87–64.95 vs 41.92–43.24 GiB; neither that difference nor Torch `allocated` accounts for all MI300A memory owners or identifies bytes immediately reusable by a given stream.
+Only one full-depth node lead (rank 36, PP2) recorded usable cgroup counters; there is no direct OOM-counter evidence on the pressure nodes.
+
+The full-depth stage-1 last entries were calls 259–262 (backward IDs 249–252); stage 2 last entered calls 261–262 and all stage-3 ranks last entered call 261.
+At stage-3 call 261, full-depth nodes still sampled 66.39–81.33 GiB available near entry.
+All four final-stage nodes then showed a rise in both node `Shmem` and `/dev/shm` allocated blocks, with the first mount increase exceeding 1 GiB about 201–205 s after entry, well after the last schedule markers.
+On the rank-60 node, `Shmem` and `/dev/shm` use rose from 20.57 and 7.27 GiB near entry to 89.31 and 76.01 GiB in the last live sample at +246.15 s; it still had 7.87 GiB available then.
+At +246.87 s the supervisor recorded the child exit `-9`, with 87.95 GiB available and 78.23 GiB still used on the mount.
+The stage-3 zero-availability sample was on a different node (lead rank 52), not the rank-60 node.
+No comparable `/dev/shm` increase was sampled in the control, where all ranks exited backward ID 255 and completed gradient finalization (1.98–5.79 s), norm preparation (4–6 ms), and optimizer step (1.51–2.51 s) as measured by host spans.
+The HSA reports lack a usable event timestamp and no kernel fault address was retained; the sample order establishes a lag after host schedule progress, not the order of the first GPU fault and the mount growth.
+
+Static inspection of the libraries in the cached image found the `GPU HANG ANALYSIS` banner in HIP (`libamdhip64.so.7`, SHA-256 `6d1dbee8cb3ad924e4c1bca7734e22f2c93026eb3bc871a7f64a916778d55e36`) and a conditional `dump_gpu_core` call in the ROCr AQL queue exception handler (`libhsa-runtime64.so.1`, SHA-256 `12d49db16881b9505629192231d5b3971e9030b26a326fc2c003e92da7de0c44`).
+The ROCr path supports `HSA_COREDUMP_PATTERN`, `HSA_COREDUMP_SHOW_PROGRESS`, `HSA_ENABLE_LIGHTWEIGHT_COREDUMP` and `HSA_DISABLE_COREDUMP_ON_EXCEPTION`; absent a pattern override it consults `/proc/sys/kernel/core_pattern`, and the file path can be relative with a `.gpu` suffix.
+The runner's training working directory and compiler temp/cache directories were under the job's `/dev/shm` tree, so a relative core output or an ordinary cache/temp writer could consume that mount.
+The frozen declaration did not set a core-pattern override, and neither the compute nodes' effective core policy nor file ownership at the time of the rise was recorded.
+Seven stage-1 logs have a hang-analysis banner, but no retained log confirms a completed GPU dump and no dump file was retained in either run's output.
+The unrelated pre-existing root-level `core_nid002774_90895` is a CPU `srun` core from job `756602`, not evidence for `764642`.
+Existing `/proc/smaps` samples retain only large ranked mappings and neither list open files nor account for unmapped tmpfs files; the late growth is consistent with a diagnostic write but is not attributed.
+The retained runtime environment also shows `HSA_NO_SCRATCH_RECLAIM=1` and `HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0` on sampled ranks, but there is no per-queue scratch byte accounting to link this policy to either event.
+
+The signed `resident_fp8.py` shows two distinct expert lifetimes: autograd keeps FC1 FNUZ rows and saved router probabilities until backward, while `_pending` holds four column-operand lists after dgrad until the per-layer delayed wgrad consumes them.
+The quantized weight cache persists by weight version.
+`drain()` pops the logical record before issuing GPU work, waits on the producer and previous drain on the stream, records the real payload and scale storages plus the FP32 destinations, then enqueues both native wgrads.
+The Python transition is not GPU completion or an allocator free.
+The signed schedule also pops P2P activation/gradient queues and releases layer state around backward; the first layer's attention wgrad is delayed past the backward P2P callback, and the signed BF16 reverse exchange relies on a ready event and a consumer stream wait.
+None of these source paths identifies the largest live owners or the first GPU failure in `764642`.
+
+###### Proposed full-depth trace boundary (not a launch review)
+
+- Keep the full recipe, signed fixes, image, topology, and all deadlines unchanged; extend only the diagnostics around backward-only calls 259–267, with an entry baseline and the existing success checks.
+- Keep coarse host/allocator boundaries on all ranks and cap detailed ownership records on one representative rank per PP1/PP3 node, plus selected P2P peers; log call, backward ID, virtual chunk/layer, operation, stream identity and monotonic time.
+- At existing ownership transitions record scalar storage identities, sizes and offsets for saved FNUZ payloads/scales and router probabilities, versioned weight caches, delayed wgrad queue entries and FP32 destinations, BF16 reverse handles' tensors, and P2P producer/receive buffers.
+- Deduplicate views within a snapshot; distinguish pointer reuse across generations, logical release, `record_stream` and host enqueue, and do not report any of them as device completion.
+- Record available allocator active/reserved/inactive and retry/OOM counters at the same boundaries, without a heap walk, new GPU wait, retained tensors, or global tracing; verify the supported counters against the pinned runtime first.
+- In the supervisor, collect bounded allocated-block deltas and open-file metadata by device/inode within job-owned scratch, including job-child deleted-but-open files when visible; separate dump-like paths, private cache/temp paths, unidentified mount growth, and any available driver/queue scratch counters.
+- Record the effective core policy and usable OOM counter coverage explicitly; preserve metadata on failure, without reading dump payloads, changing dump policy, or treating missing visibility as a negative result.
+
+The gates for this diagnostic are usable ownership and file-growth attribution, or an explicit record of which counters or paths were unavailable; neither a last host enqueue nor a kernel-load log is enough to name a faulting operation.
+No training code, validator, frozen artifact, launch guard, or allocation was changed by the audit.
+A new exact outside-sandbox launch review and explicit approval would be required after CPU validation of the proposed instrumentation.
+
+##### Full-depth single-worker compilation: exact launch review
+
+The user requested a full-depth retry with compilation limited to one worker.
+The [guarded declaration](../chonk-native-fnuz-compile1-i910bfcf936d3/experiment.toml) keeps the `764642` 42-layer training arguments, full batch and topology, both memory mitigations, image `910…`, signed Megatron `041c1d753028e4190efb342accb98a6f362ee7dd`, and verified private CK prewarm.
+The only workload environment changes are `TORCHINDUCTOR_COMPILE_THREADS=1` (was 4), `MAX_JOBS=1` (was 8), `MAKEFLAGS=-j1`, and `CMAKE_BUILD_PARALLEL_LEVEL=1`.
+Pinned Inductor takes the inline path at one thread; `MAX_JOBS` caps supported extension/Ninja builds, not independent compilers across ranks or vendor tools that ignore the controls.
+Keep `OMP_NUM_THREADS=18` and training placement unchanged.
+The validator requires the effective Inductor thread count and the build environment at observer installation and at update entry.
+Keep the existing traces, 60-minute allocation, 2,700-second rank-child bound, 600-second identity wait, 240-second CK prewarm, 300-second coordination, and 600-second UCCL host wait.
+Slower inline compilation may hit an existing bound; do not extend it or retry automatically.
+A terminal pass still requires one finite, unskipped full-size update on all 64 ranks; no checkpoint, throughput measurement, or cache publication is included.
+
+The current checkout's CLI registers `--exclude` twice.
+Use the unmodified `764642` frozen runner package, verified against the retained tooling manifest, instead of modifying or bypassing the current parser.
+The no-submit plan matched the retained recipe, launch resources, image, and source manifest except for the reviewed serial-build environment and experiment metadata.
+191 focused CPU tests passed; the broader suite hit the existing CLI regression and exceeded the local test command bound.
+The signed Megatron checkout, signer, parent, tree, and reviewed blobs were verified.
+Reviewed guarded declaration SHA-256: `f0ceb344db47401d52a50f82c49c620b12f9a6b1c913fb19666139b336d468f9`.
+Reviewed validator SHA-256: `51c554e3d58eaa440ea07eb4cc4611ba5bd05c6832cdccc62ef6ff4b77611d6d`.
+
+Use 16 exclusive x86-64 Beverin `mi300` nodes under `csstaff` in `cscs`, four MI300A ranks per node, 48 CPUs per rank, `map_ldom:0,1,2,3`, `block:block`, `pmix`, `disable_rdzv_get`, all allocatable memory, and `nid002450` excluded.
+The plan uses `--uenv-passthrough=ignore` for the batch job and the same cached EDF image, with no inherited agent uenv.
+The agent cannot run this topology inside its allocation; the batch job will execute outside the agent sandbox with normal host filesystem access.
+At review, 16 eligible `cscs` nodes were idle and none of our investigation jobs were in the queue.
+Recheck capacity and the 16-node cap before submitting once; do not switch reservations or affect other jobs without a new review.
+Report about every three minutes and promptly on terminal status.
+
+From `/ritom/scratch/cscs/boeschf/apertus-amd`, after approval and one-shot guard verification:
+
+```bash
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-timeout600-i910bfcf936d3/20261126T084820Z-193edd18/tooling \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/python -m apertus_amd.cli run \
+  experiments/chonk-native-fnuz-compile1-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-bf16-reverse-ready \
+  --submit --gpus-per-node 4 --cpus-per-task 48 \
+  --cpu-bind map_ldom:0,1,2,3 --time 01:00:00 --cache-mode cold --exclude nid002450 --cache-image \
+  --reservation cscs
+```
+
+Artifacts go under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-compile1-i910bfcf936d3/<run-id>/`; private source copies and caches are under job-owned `/dev/shm/apertus-amd/`.
+EDF image: `/ritom/scratch/cscs/boeschf/apertus-amd/cache/images/sha256/910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490/image.sqsh`.
+The user approved this exact outside-sandbox launch.
+The pre-submit recheck found 32 eligible idle `cscs` nodes and no other investigation requests we submitted.
+The diagnostic was submitted once as job `764827`; the one-shot guard is restored.
+The [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-compile1-i910bfcf936d3/20261126T114734Z-cc4c2f7c/) is retained.
+
+###### `764827` training outcome: serial compilation did not clear the late backward failure
+
+All 64 ranks reported one effective Inductor compile thread and the serial build environment at observer installation and update entry, and verified that training mapped their private CK copies.
+The two traced dispatches returned on all lanes in 107.11–107.31 s (versus 120.45–122.02 s in `764642`), with the corresponding receive and cached reverse GPU markers complete.
+The run still reached the same late-backward window: stage 0 completed schedule call 267, while the last entries on stages 1–3 were in calls 259–262.
+The first persisted child failure was stage-0 rank 10's `exit:-11` (SIGSEGV), recorded about 102.83 s after its final schedule exit.
+The runner began peer-failure shutdown, with no recorded update on any rank.
+No retained rank log in the failure snapshot reported an HSA queue fault or an OOM; the signal and these host boundaries do not identify a faulting operation.
+Peer shutdown stalled with 56 durable failure records (rank 10 and 55 peer failures); only job `764827` was cancelled at 24:36.
+Slurm recorded `CANCELLED` with step exit `0:9`, and the allocation cleared from `squeue`.
+The step exit reflects shutdown, not the original rank-10 `-11` child exit.
+No `result.json` or `checks.json` was written.
+
+At matched stage-1 backward ID 249, the four-rank node Torch allocated sums were 222.49–223.79 GiB at the recorded precision in both full-depth runs; reserved sums were 287.47–289.74 GiB in `764827` vs 285.87–288.05 GiB in `764642`.
+Three stage-1 nodes sampled zero `MemAvailable`; no usable node cgroup OOM counters were retained for `764827`.
+Through the failure snapshot, final-stage `/dev/shm` stayed near 7.27 GiB rather than showing the late rise from `764642`; two stage-0 nodes showed mount use as high as 20.10 and 25.87 GiB, without file attribution.
+The runs stopped at different times and did not use identical node placement, so the contrast does not establish that compilation caused the prior fault, that a core dump was written, or that either run was OOM-killed.
+No retry, checkpoint, or cache publication was attempted.
+
+##### Full-depth ownership trace: exact launch review
+
+The [guarded declaration](../chonk-native-fnuz-ownership-i910bfcf936d3/experiment.toml) takes `764827` as the control: identical 42-layer arguments, full batch and topology, compile limits, image `910…`, signed source `041c1d753028e4190efb342accb98a6f362ee7dd`, head chunking, FC1 replay, and private CK prewarm.
+The only experiment settings added are `APERTUS_CHONK_OWNERSHIP_TRACE=1` and `scratch_telemetry=true`.
+The one-shot guard remains in place.
+
+- For backward-only calls 259–267, collect allocator and stream scalars at entry and exit on all 64 ranks, with the actual virtual chunk and backward ID.
+- Reuse the bounded schedule-node and optimizer phase observer on all ranks.
+- On ranks 0, 4, …, 60 and previous failing rank 10, sample saved FNUZ rows/scales, versioned expert weights, the delayed wgrad queue and its two native GEMMs, FP32 destinations, BF16 reverse inputs/outputs and handle tensors, native P2P sends/receives, and layer release.
+- Use at most 128 detailed observations per rank/call plus the boundary records, at most 512 operand entries per observation, and at most four representative storage identities per role.
+- Deduplicate views within each observation; reused addresses alone do not join lifetimes across observations.
+- Do not re-unpack saved router probabilities, retain tensors, add device waits, or interpret host returns as GPU completion.
+- From the supervisor, record allocated blocks and device/inode metadata in job-owned scratch, including deleted-but-open files visible through the rank child's descriptors; use a 15 s cadence and attempt a final sample on child exit or interruption.
+- Limit each node-lead tree traversal to 4,096 entries and each rank's descriptor scan to 1,024 descriptors across at most 32 visible processes; retain the 16 largest observed files and aggregate byte counts by category.
+- Record kernel core-pattern visibility and available cgroup counters; do not change dump policy or read dump contents.
+- Native per-queue scratch inspection is not implemented, and unmapped files outside the job tree, closed deleted files, unobserved in-flight changes, and incomplete scans are attribution limits.
+
+195 focused CPU tests passed.
+The complete CPU suite reported 2,310 passed and one failure: the candidate-image CLI test mocks source preparation but does not create the `manifest.json` the runner expects.
+CPU tests and signature checks do not qualify the GPU hooks.
+This plan uses the current runner to stage the new supervisor telemetry; it removes the duplicate `--exclude` registration in the CLI.
+Relative to `764827`'s frozen runner, the unchanged repository `runs.py` already includes optional `--nodelist` support, unused here.
+The no-submit plan and the previous frozen inputs were compared, and the current signed Megatron tree, signer, parent, reviewed files and cached image were rechecked.
+
+| Reviewed input | SHA-256 |
+| --- | --- |
+| `experiments/chonk-native-fnuz-ownership-i910bfcf936d3/experiment.toml` (guarded) | `4c667edccf6a617faac2ff6b3859f1ee9a29fad51e24e45c0f9a52c1e81abfe6` |
+| `experiments/validation/chonk_fnuz_oom.py` | `b9df44714166791dde17f4d6756cdc93fb02bc336c5e57c2a752e9e5db270116` |
+| `src/apertus_amd/cli.py` | `8c25e19a7c1d4e5a35ccaefdce7bb9f3a0e31550fb9e2dc73b0f985c5aa8b50d` |
+| `src/apertus_amd/config.py` | `d21fa84e4d41b20e63ac3451d9ac7777d522b34f7a649d0e2cdb216be1418adb` |
+| `src/apertus_amd/memory_telemetry.py` | `d45486523a1ba61fe69cd9aa306b21cde248c5e171bf60bcc41a86acd6612f55` |
+| `src/apertus_amd/runs.py` | `5009bac3e1bfade5349c50480cb79a98446b63757a8fc7ae4fc80eee45bbbbaa` |
+| `src/apertus_amd/runtime.py` | `4101803e925b91866592215cd0b84bbd5a644327a7588a2af833e7597b6eb406` |
+
+The topology requires a new Slurm allocation outside the agent sandbox, with normal host filesystem access and no agent uenv passthrough.
+Use 16 exclusive x86-64 `mi300` nodes under `csstaff` in `cscs`, 4 MI300A ranks/node, 48 CPUs/rank, `map_ldom:0,1,2,3`, `block:block`, `pmix`, `disable_rdzv_get`, all allocatable memory, and `nid002450` excluded.
+At review, 16 eligible `cscs` nodes were idle and there were no other investigation jobs we submitted.
+Recheck capacity and the 16-node cap before any submission, and leave other jobs alone.
+Keep the 60-minute allocation, 2,700-second child bound, 240-second node CK prewarm, 300-second coordination and existing UCCL CPU/GPU deadlines.
+Do not retry or extend deadlines automatically.
+
+From `/ritom/scratch/cscs/boeschf/apertus-amd`, after explicit approval and one-shot input verification:
+
+```bash
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-native-fnuz-ownership-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-bf16-reverse-ready \
+  --submit --gpus-per-node 4 --cpus-per-task 48 \
+  --cpu-bind map_ldom:0,1,2,3 --time 01:00:00 --cache-mode cold --exclude nid002450 --cache-image \
+  --reservation cscs
+```
+
+EDF image: `/ritom/scratch/cscs/boeschf/apertus-amd/cache/images/sha256/910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490/image.sqsh`.
+Artifacts go under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-ownership-i910bfcf936d3/<run-id>/`, with private caches and source copies limited to job-owned `/dev/shm/apertus-amd/`.
+Report approximately every three minutes and promptly on failure or completion.
+Retain partial observations without treating them as a fit verdict; a fit verdict still requires one finite, unskipped update and passing validation on all 64 ranks.
+No checkpoint, cache publication, or benchmark is included.
+The user approved the exact outside-sandbox launch.
+The pre-submit recheck found 16 eligible idle `cscs` nodes and no other investigation requests we submitted.
+The diagnostic was submitted once as job `764998`; the one-shot guard is restored.
+The [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-ownership-i910bfcf936d3/20261126T123721Z-231202bc/) is retained.
+
+###### `764998` outcome: late backward faults recurred; dump writes explain the final-stage scratch surge
+
+All 64 ranks verified one effective Inductor compile thread and mapped their private CK objects in training.
+The two traced dispatches completed on all lanes in 144.16–144.37 s with the corresponding GPU receive and cached BF16 reverse markers complete.
+The workload again lost progress in the late backward drain: stage 0 completed call 267 and all 16 of its ranks entered, but did not exit, gradient finalization.
+Stages 1–3 last entered calls 260–262, with no `update_exit` on any rank.
+The pre-cancel snapshot showed stage-1 `HSA_STATUS_ERROR_MEMORY_FAULT` on three ranks and `HSA_STATUS_ERROR_EXCEPTION` on one, plus the exception on five final-stage ranks.
+The last detailed host markers varied among reverse dispatch, expert backward, FC2 wgrad, and reverse combine; they do not identify the primary GPU fault.
+No native P2P post observation was recorded in the scoped trace; that is a coverage gap, not evidence that P2P was idle.
+After retaining the failure and scratch evidence, only `764998` was cancelled at 24:05.
+Slurm recorded the training step as `CANCELLED` with exit `0:9` during shutdown, and the allocation cleared.
+Neither `result.json` nor `checks.json` was written.
+No child exit was recorded before cancellation, and no checkpoint, cache publication, or retry was attempted.
+
+On stage 1 at call 259 (backward ID 249), four-rank sums per node were 222.49–223.79 GiB Torch allocated, 246.47–247.58 GiB active, and 284.50–285.92 GiB reserved.
+The allocated range matches the two earlier full-depth failures, and about 23–25 GiB per node was active but not allocated in those snapshots.
+Observed inactive-split bytes, Torch allocation retries, and Torch OOM counters were zero.
+Two stage-1 node leads sampled zero `MemAvailable` while `/dev/shm` stayed near 7.25 GiB; cgroup OOM coverage remained incomplete.
+Detailed stage-1 samples show 0.438–0.801 GiB of deduplicated delayed-wgrad column operands per sampled drain entry, and 3.691 GiB of backing FP32 main-gradient storage per sampled wgrad invocation.
+Those are per-observation storage sizes, not additive allocations or totals across layers; the same FP32 backing storage can appear in multiple roles or events.
+These observations do not establish an OOM or identify what holds the allocator's active-but-not-allocated blocks.
+
+On three stage-3 nodes, `/dev/shm` first exceeded its baseline by 1 GiB about 203–205 s after call-261 entry.
+The bounded inventories identified `probe/source/core_<host>_<pid>.gpu` files whose PIDs matched training ranks 51, 53, 54, 55 and 56; those ranks also logged HSA exceptions.
+On the nodes led by ranks 48 and 52, paired samples show mount use rising from 7.27 GiB to 64.53 and 56.98 GiB, with 57.26 and 49.72 GiB, respectively, accounted for by `.gpu` file blocks.
+The node led by rank 56 also showed a `.gpu` file with at least 41.99 GiB in a paired sample; the fourth final-stage node stayed near baseline.
+The observed core pattern was `core_%h_%p`, consistent with the pinned ROCr relative `.gpu` output path.
+File and mount sampling are not atomic, and inventories were partial, but inode/block metadata accounts for the late final-stage scratch surge in this run.
+This does not prove what caused the earlier loss of progress or that the previous run wrote the same files.
+The next useful comparison is the stage-1 working set and stream retirement before call 259; increasing compile or communication deadlines would not address the measured pressure.
+
+##### KDA backward tensor-release A/B: exact launch review
+
+The [guarded component probe](../chonk-kda-backward-release-i910bfcf936d3/experiment.toml) measures the effect of dropping KDA backward temporaries after their last use.
+Image `910` ships `fla-core==0.5.2`, and its `fla/ops/kda/chunk_bwd.py` is byte-for-byte identical to the corresponding file in `6c70d55`'s parent `9c8e42e762fce087c27b673af4922795d9edb85e`.
+The baseline file has Git blob `fa346b1b1d5739a00b6cfbc845ee7f599f81e9e1` and SHA-256 `069395c9232647f5a4b82fa2dfe7ca077423016d4b641f2696f9d6328dc2e9be`.
+The clean detached FLA checkout pins `6c70d55a71e7fb4fca7de990015f6a3046193762`, tree `2a1ffa79752f840d8b0f7a986285e4dce7e8d529`, signed by `FB605768E5C3B6BE52CA4B09B5C8CB8659FA42E6`.
+The sole changed blob is `f749ec3938c3df91cc2387b2f02ea81db99c02cc` (SHA-256 `79d34bd5711a71e455a6b0346085c9431f5b224a5766ed839468a8902ead0e21`), with five reference-clearing insertions.
+For the candidate, import only that complete file from the frozen Git archive under its canonical module name; all other FLA imports remain in the image.
+No patch is applied at runtime, no image is edited, and no package upgrade or training-code change is included.
+
+Use the Chonk KDA core shape `B=2, S=4096, H=HV=28, K=V=128` with synthetic seeded BF16 inputs, fused Q/K normalization and gate/beta handling, safe decay bound `-5`, recompute enabled, and CP1 without recurrent state.
+This is a KDA backward component fixture, not a Megatron layer or distributed training replay.
+Run baseline/candidate/candidate/baseline in four fresh processes on the same GPU.
+Each arm verifies the exact backward call once, performs three warmups, and retains five synchronized backward measurements with a matched allocator reset policy and no profiling in the measured samples.
+Report allocated and reserved bytes at backward entry and their backward peaks, including all samples.
+Require finite, bitwise-equal output and seven input/parameter gradients across all arms and matched allocated bytes at backward entry.
+A material saving requires at least 32 MiB less median peak allocated in both pairings; reserved bytes and wall times are reported separately.
+Passing numerics without a memory saving is a valid component result, not a reason to proceed to a full-depth trial.
+
+60 focused CPU tests passed; no GPU execution is implied.
+Reviewed guarded declaration SHA-256: `2e715195b161a4f1004b394f2c713fdabc47f464ca04314478fa6c06fcfd8eb3`.
+Reviewed validator SHA-256: `173c202a37c3e24aac9300a933cf01d4bed523a25b1dfedf548554f01ee8d96f`.
+
+Use a new exclusive x86-64 Beverin `mi300` node in `cscs`, under `csstaff`, with one MI300A task, 48 CPUs bound to cores, `block:block`, `pmix`, `disable_rdzv_get`, all allocatable memory, and `nid002450` excluded.
+Do not reuse the interactive allocation hosting the agent: this diagnostic needs exclusive, disjoint placement for comparable memory samples.
+The Slurm launch runs outside the agent sandbox with normal host filesystem access, `--uenv-passthrough=ignore`, and the cached image `910`.
+The allocation bound is 35 minutes, the child bound is 1,500 seconds, and the GPU identity wait is 600 seconds.
+At review there were 14 eligible idle `cscs` nodes; recheck capacity and the investigation cap before submitting.
+
+From `/ritom/scratch/cscs/boeschf/apertus-amd`, after approval and one-shot input verification:
+
+```bash
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-kda-backward-release-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/checkouts/fla-kda-release-6c70d55a71e7 \
+  --submit --gpus-per-node 1 --cpus-per-task 48 --cpu-bind cores \
+  --time 00:35:00 --cache-mode cold --exclude nid002450 --cache-image --reservation cscs
+```
+
+The frozen image is `/ritom/scratch/cscs/boeschf/apertus-amd/cache/images/sha256/910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490/image.sqsh`.
+Artifacts are under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-kda-backward-release-i910bfcf936d3/<run-id>/`; source copies and private compilation caches are in job-owned `/dev/shm/apertus-amd/`.
+No checkpoint, shared cache publication, deadline extension, or automatic retry is included.
+The user approved the exact outside-sandbox launch.
+The pre-submit check found 14 eligible idle `cscs` nodes and no other investigation jobs we submitted.
+Job `765106` was submitted once, and the one-shot guard is restored.
+The [frozen component run](../../artifacts/experiment-data/runs/chonk-kda-backward-release-i910bfcf936d3/20261126T134947Z-b85b42bf/) is retained.
+
+###### `765106` result: KDA backward release passed parity and reduced peak allocation
+
+Slurm completed in 3:58 with exit `0:0` on `nid002778`; the allocation cleared and the runner and `checks.json` both passed.
+All 20 warm samples matched bitwise for the output and seven gradients, with identical backward-entry memory (507.077 MiB allocated, 970 MiB reserved).
+Every baseline sample peaked at 1,968.327 MiB allocated and every signed-release sample peaked at 1,464.327 MiB, a reduction of **504 MiB** in both pairings.
+Median peak reserved fell from 2,260 to 1,924 MiB in both pairings (**336 MiB**).
+The four arm medians were 61.943, 49.409, 48.884, and 63.693 ms in ABBA order; these are synchronized component host timings, not training throughput.
+The probe published no cache and qualifies only the isolated KDA backward component.
+The saving cannot be multiplied by layer count and does not establish full-depth fit or identify the cause of the prior late-backward faults.
+The result supports reviewing a separately approved full-depth trial with the same signed module and no other workload changes.
+
+##### Full-depth signed KDA release: exact launch review
+
+The [guarded trial](../chonk-native-fnuz-kda-release-i910bfcf936d3/experiment.toml) retains the `764998` 42-layer arguments, environment, one-thread compilation, BF16 reverse readiness fix, native FP8 path, head chunking, FC1 replay, private CK prewarm, and ownership and scratch telemetry.
+Keep the existing 60-minute allocation, 2,700-second child deadline, 600-second GPU identity wait, 240-second node CK prewarm, 300-second coordination, and unchanged UCCL CPU and GPU deadlines.
+The only workload change is selecting the complete signed FLA `6c70d55a71e7fb4fca7de990015f6a3046193762` backward module from the retained `765106` source archive.
+The runner checks the archived manifest and member digests, freezes that single file as `auxiliary.py`, and mounts it read-only at `/apertus/auxiliary.py`.
+The validator verifies the shipped FLA 0.5.2 baseline bytes, resolves only `fla.ops.kda.chunk_bwd` to the candidate, and checks the origins of all other loaded FLA modules.
+It records the first actual KDA backward call and return on each rank using a one-shot host observer that restores the original function before calling it.
+No live vendor file, image, source checkout, or existing run is edited.
+
+Both clean source checkouts, their user signature, parent, tree, and reviewed blobs were reverified.
+The offline freeze check recovered the same complete bytes as the A/B candidate, and the dry plan matched `764998` except for the auxiliary member, review guard, and validator/tooling metadata.
+204 focused CPU tests passed.
+The complete CPU suite reported 2,317 passed and one failure in the same candidate-image CLI fixture, whose mocked source preparation omits `manifest.json`.
+No full-depth GPU evidence exists for this candidate yet.
+
+| Reviewed input | SHA-256 |
+| --- | --- |
+| `experiments/chonk-native-fnuz-kda-release-i910bfcf936d3/experiment.toml` (guarded) | `3a871404d940afd9a3c87a8502dcc335fca516674febaf13a106a4f4fea9bdfc` |
+| `experiments/validation/chonk_fnuz_oom.py` | `a6342ebe512e649edbe146f668eb4e400b24be00f64b77848463919ed71de928` |
+| `src/apertus_amd/config.py` | `3ad9ddcc73153c228d6707e0d105bdace3b82787805479659194497e811cd1c2` |
+| `src/apertus_amd/runs.py` | `25041498c39dc6d208fa57940714d31b91e8b58a9f6342ad5b80a37d337ad446` |
+| `src/apertus_amd/sources.py` | `89bd9f57179541c15038839eb38b8b3dfbc111ac652b8b812ee94bfdc97eb054` |
+
+Use 16 exclusive x86-64 Beverin `mi300` nodes in `cscs` under `csstaff`, four MI300A ranks per node, 48 CPUs per rank, `map_ldom:0,1,2,3`, `block:block`, `pmix`, `disable_rdzv_get`, all allocatable memory, and `nid002450` excluded.
+The topology requires a new allocation outside the agent sandbox with normal host filesystem access and `--uenv-passthrough=ignore`.
+At review, 14 eligible `cscs` nodes were idle, fewer than the required 16.
+A subsequent read-only check found 30 eligible idle nodes; the trial remains guarded pending exact launch approval.
+Recheck capacity and the investigation cap immediately before submission, and do not submit with inadequate idle capacity or substitute a different reservation without review.
+
+From `/ritom/scratch/cscs/boeschf/apertus-amd`, after approval and verification:
+
+```bash
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-native-fnuz-kda-release-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-bf16-reverse-ready \
+  --submit --gpus-per-node 4 --cpus-per-task 48 \
+  --cpu-bind map_ldom:0,1,2,3 --time 01:00:00 --cache-mode cold --exclude nid002450 --cache-image \
+  --reservation cscs
+```
+
+EDF image: `/ritom/scratch/cscs/boeschf/apertus-amd/cache/images/sha256/910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490/image.sqsh`.
+The retained FLA archive is `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/sources/6c70d55a71e7fb4fca7de990015f6a3046193762/source.tar`.
+Artifacts are under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-kda-release-i910bfcf936d3/<run-id>/`, with private caches in job-owned `/dev/shm/apertus-amd/`.
+Report about every three minutes once running, and promptly on failure or completion.
+Require one finite, unskipped full-size update and all-rank validation; compare sampled stage-1 headroom and allocator state at backward ID 249 against `764998`.
+No checkpoint, cache publication, throughput verdict, deadline extension, or automatic retry is included.
+The user approved this exact outside-sandbox launch.
+The pre-submit check found 28 eligible idle `cscs` nodes and no other investigation jobs we submitted.
+Job `765130` was submitted once, and the one-shot guard is restored.
+The [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-kda-release-i910bfcf936d3/20261126T140650Z-a1f8b830/) is retained.
+
+###### `765130` outcome: the KDA release reached more of the drain, but did not complete an update
+
+All 64 ranks verified the signed KDA module, recorded a return from its first training backward call, and mapped their private CK objects.
+The two traced dispatches completed in 107.72–108.28 s with their recorded GPU dependencies complete.
+All ranks on stages 0 and 3 and 13 of 16 on stage 2 finished their backward schedules and entered gradient finalization; in `764998`, only the 16 stage-0 ranks reached that phase.
+No rank finished gradient finalization or recorded an update.
+Stage 1 last entered calls 260–264, and the logs showed HSA exceptions on three stage-1 ranks and four final-stage ranks.
+The trace does not identify the first failed GPU operation or establish that the KDA change caused the schedule progress difference.
+
+At stage-1 call 259 (backward ID 249), four-rank sums per node were 222.49–223.78 GiB Torch allocated, 247.35–251.89 GiB active, and 285.21–287.76 GiB reserved.
+Against `764998`, allocated memory was essentially unchanged and neither active nor reserved memory was lower at that matched boundary.
+The stage-1 minimum sampled `MemAvailable` was 0.21 GiB, and observed Torch allocator retry and OOM counters stayed at zero.
+The 504 MiB isolated KDA peak reduction remains valid for that component; it does not imply an equivalent reduction in the distributed working set.
+
+Final-stage `/dev/shm` use again grew late, with mount peaks of 56.25 GiB on the node led by rank 52 and 76.92 GiB on the node led by rank 60.
+On rank 60's node, the rank-62 PID-matched `.gpu` core file accounted for 66.64 GiB of blocks in a sample with 73.91 GiB mount use versus approximately 7.26 GiB before the rise.
+The visible `/sys/fs/cgroup` `oom_kill` counter on that node rose from 0 to 1 shortly before rank 60's recorded child exit `-9`.
+This establishes a late OOM kill in the observed cgroup, consistent with the rank-60 exit, but does not name the victim independently or explain the earlier HSA exceptions and stalled training.
+Only job `765130` was cancelled at 23:50 after the durable child failure and peer aborts.
+Slurm recorded the training step as `CANCELLED` with exit `0:9` during shutdown, and the allocation cleared.
+No `result.json`, `checks.json`, checkpoint, cache publication, or retry followed.
+
+##### Single-MI300A KDA core recompute: exact launch review
+
+The [probe declaration](../chonk-kda-core-recompute-i910bfcf936d3/experiment.toml) compares `layernorm linear_attn qkv shared_experts` (A) with `layernorm qkv shared_experts` (B).
+It builds the actual BF16 Megatron KDA sublayer through the pinned TE-backed spec at `S4096/B2/hidden3584/H28/D128`, with TP=CP=1 and the same signed FLA backward in both arms.
+`layernorm` and `shared_experts` remain in both config lists but do not exercise the enclosing transformer block or MoE here.
+The isolated sublayer uses immediate TE weight gradients, not the delayed-wgrad pipeline schedule, DDP main-grad buffers, or the optimizer.
+
+Run A/B/B/A in fresh serial processes on the same GPU with the same private probe JIT cache.
+In each process, verify exact fixture inputs and weights, hold four forward graphs, and drain backward oldest first with fixed cotangents.
+An untimed pass requires four `qkv` producer replays and four signed FLA backward returns in each arm; `chunk_kda` must replay four times in A and zero times in B.
+FLA's internal backward recompute stays on.
+Require finite, bitwise-identical outputs, input gradients and all trainable parameter gradients across the four processes.
+Then collect five uninstrumented samples per process after three warmup schedules, without flushing the warmed Torch allocator or dropping slow samples.
+Report matched forward entry, forward-retained bytes and forward peak, absolute backward peak and its increment above backward entry, and synchronized host time for each phase.
+Report allocated and reserved separately, with both paired B−A median deltas.
+A passing comparison does not require a saving and is not proof of distributed fit or training throughput.
+
+The clean Megatron and FLA checkout signatures, trees, parents and reviewed blobs match the previous signed runs, including all six Megatron files checked at probe import.
+The retained Megatron archive and signed auxiliary file were verified against those inputs; the auxiliary mount is read-only.
+158 focused CPU tests passed; the full CPU suite had 2,327 passes and the existing candidate-image fixture failure from an omitted `manifest.json`.
+No GPU execution has been performed for this comparison.
+Reviewed guarded declaration SHA-256: `d0076b3645fdc21598d2d283faf161d01ff255da1d5400d7b1b4eb9155dfeec9`.
+Reviewed validator SHA-256: `9cc13bf3fa35c043c33d27d4a98b733010313d8fb9fe8a2d710a21ce9505a367`.
+
+Use one new exclusive x86-64 Beverin `mi300` node under `csstaff` on `cscs`, with one MI300A task, 48 CPUs bound to cores, `block:block`, `pmix`, `disable_rdzv_get`, all allocatable memory, and `nid002450` excluded.
+The pinned image and exclusive GPU cannot be used for this test inside the current sandbox or the existing interactive allocation.
+The job executes outside the agent sandbox with normal host filesystem access and `--uenv-passthrough=ignore`.
+Use the same bounds as the previous component probe: 35 minutes allocation, 1,500 seconds for the child (all four processes), and 600 seconds for GPU identity.
+30 eligible idle `cscs` nodes were visible at review, with no other investigation jobs we submitted; recheck both capacity and the 16-node cap at submission.
+Do not touch the unrelated CI and interactive jobs.
+
+After explicit approval and one-shot verification:
+
+```bash
+cd /ritom/scratch/cscs/boeschf/apertus-amd
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-kda-core-recompute-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-bf16-reverse-ready \
+  --submit --gpus-per-node 1 --cpus-per-task 48 --cpu-bind cores \
+  --time 00:35:00 --cache-mode cold --exclude nid002450 --cache-image --reservation cscs
+```
+
+The cached image is `/ritom/scratch/cscs/boeschf/apertus-amd/cache/images/sha256/910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490/image.sqsh`.
+The runner freezes the job, resolved inputs and evidence under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-kda-core-recompute-i910bfcf936d3/<run-id>/`.
+Use job-owned `/dev/shm/apertus-amd/` for unpacked source and the private rank JIT cache.
+No checkpoint, cache publication, deadline extension, or automatic retry is included.
+Report about every three minutes while running and promptly on success or failure.
+The user explicitly approved this exact outside-sandbox launch.
+The pre-submit check found 30 eligible idle `cscs` nodes and no other investigation jobs we submitted.
+Job `765141` was submitted once, the guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-kda-core-recompute-i910bfcf936d3/20261126T145332Z-d4b39bd2/) is retained.
+
+###### `765141` outcome and corrected one-shot launch
+
+Slurm reported `FAILED` after 56 seconds (`1:0`) and the allocation cleared.
+After GPU startup, the standalone Megatron `TransformerConfig` constructor rejected the missing `linear_attention_freq` before module construction or any measured forward.
+The failed run did not produce arm evidence, samples, or `checks.json`.
+
+The corrected validator supplies the exact 42-entry full-run frequency in both arms and leaves the comparison itself unchanged.
+The focused CPU suite passed 159 tests, and a CPU preflight exercising the signed config classes with dependency shims reproduced the original assertion and passed both corrected configs.
+Corrected validator SHA-256: `db5e32d790d4d5136a189f6e12ad42bd2d83f5316c23eaba18a10051ebf52dcd`.
+The user approved one corrected launch using the identical command, placement, paths, environment and deadlines above.
+This does not authorize any further attempt.
+The pre-submit check found 30 eligible idle `cscs` nodes and no other investigation jobs we submitted.
+The corrected launch was submitted once as `765143`, and the guard is restored.
+The [corrected frozen run](../../artifacts/experiment-data/runs/chonk-kda-core-recompute-i910bfcf936d3/20261126T145714Z-c295df01/) and the original failure are retained separately.
+
+###### `765143` outcome: dropping `linear_attn` raised memory and cut replay time
+
+All four GPU processes completed, collected five warm samples each, and verified the intended replay counts.
+Each traced schedule saw four `qkv` producer replays and four signed backward returns; A replayed `chunk_kda` four times, B zero.
+All 20 samples had identical forward-entry allocation of 581.802 MiB.
+In both pairings B retained 1,358 MiB after four forwards versus 448 MiB for A, an increase of **910 MiB**.
+Absolute forward peak increased from 1,872.864 to 2,555.364 MiB, and absolute backward peak increased from 2,746.646 to 3,429.146 MiB (**+682.5 MiB** in each phase).
+The backward peak above its own entry fell by 227.5 MiB, but that saving was smaller than the extra memory already live when backward started.
+Warm reserved memory did not grow within a sample; it was already 3,598 MiB at entry in both B processes versus 3,130 and 2,870 MiB in A.
+Paired median backward host time fell by 5.64–5.87 ms (7.9–8.2%), and combined forward-plus-backward host time fell by 5.43–5.86 ms (5.5–5.9%).
+These timings describe only the isolated schedule, not training throughput.
+
+The strict bitwise gate failed only on the finite `conv1d.weight` gradient.
+Its hash differed between the two A processes and between the two B processes, while one A and one B matched.
+The input and weight fixtures, all four outputs, all four input gradients, and the other nine trainable parameter gradients matched bitwise across all four processes.
+The hash-only receipts cannot quantify the convolution-gradient differences or attribute them to the toggle; no numerical acceptance is claimed.
+Slurm recorded `FAILED` after 5:19 (`1:0`) because the comparison check rejected the mismatch, not because GPU execution failed.
+The allocation cleared, samples and check results were retained, and no cache was published.
+Keep `linear_attn` for the memory-constrained 42-layer recipe; these component measurements do not establish distributed fit and do not justify a full-depth trial of this removal.
+
+##### Offline stage-1 allocation audit: warmup establishes the live set, drain raises residency
+
+Compared retained [stock 42-layer `764998`](../../artifacts/experiment-data/runs/chonk-native-fnuz-ownership-i910bfcf936d3/20261126T123721Z-231202bc/), [signed KDA 42-layer `765130`](../../artifacts/experiment-data/runs/chonk-native-fnuz-kda-release-i910bfcf936d3/20261126T140650Z-a1f8b830/), and [passing 24-layer `764651`](../../artifacts/experiment-data/runs/chonk-reduced24-native-fnuz-drain-i910bfcf936d3/20261126T092801Z-b35edd56/).
+Grouped PP1 ranks 16–31 by the `node` field in `output/rank-*.json`, summing each four-rank node at the same logical schedule boundary in `gpu-progress-rank-*.jsonl`.
+These are not synchronized four-rank samples and nodes are not physically matched across jobs.
+The high-level geometry and forward/backward IDs match, but each PP1 VPP chunk has six MoE layers at 42 depth versus three at 24 depth, with a different KDA/SWA mix.
+
+| PP1 boundary | Signed 42-layer allocated / reserved, GiB/node | Passing 24-layer allocated / reserved, GiB/node |
+|---|---:|---:|
+| Update entry | 97.50–98.20 / 97.81–98.48 | 48.66–49.34 / 48.87–49.57 |
+| Return from fill call 9 | 252.00–253.67 / 261.26–262.51 | 127.05–127.53 / 135.12–135.93 |
+| Return from last forward, call 256 | 253.29–254.98 / 282.91–284.71 | 128.39–128.86 / 153.33–154.30 |
+| Backward-only call 259 entry (B249) | 222.48–223.78 / 285.21–287.76 | 112.60–113.09 / 154.56–156.33 |
+| Backward-only call 259 return | 207.61–208.65 / 286.97–289.91 | 105.02–105.54 / 156.67–158.52 |
+
+The stock 42-layer control reproduced the signed run's allocation pattern.
+The pinned PP4/VPP2 schedule with four microbatches per virtual group and EP overlap gives PP1 nine fill forwards before its first backward.
+Replaying the logged forward and backward IDs leaves five outstanding host-schedule graphs in chunk 0 and four in chunk 1 after calls 9 and 256 in all three runs.
+Relative to update entry, those first nine forwards add **153.80–155.59 GiB/node at 42 layers vs 78.19–78.86 GiB/node at 24 layers**.
+After the first touch of each chunk (calls 1 and 5), each additional fill forward adds 15.09–15.65 GiB/node at full depth vs 7.73–7.87 GiB/node in the control.
+The live allocation plateaus near that level until the drain, rather than growing with all 128 training microbatches.
+This localizes the bulk of the depth-dependent growth to what remains live after each **fill forward**, not to a late KDA backward allocation.
+These increments include persistent first-use allocations and scheduler state and do not by themselves give a tensor inventory.
+
+At update entry, the rank-16 DDP log prints six padded bucket sizes and FP32 `main_grad` dtype; the buckets sum to 3,010,024,572 elements at 42 layers and 1,500,808,304 at 24.
+The corresponding rank-16 baseline is 24.551 and 12.432 GiB allocated.
+Counting the model storage (BF16 plus the small FP32 KDA decay buckets), the FP32 gradient buffers, and the routed FP32 optimizer master copies (`EDP=1`; the pinned layer-wise optimizer shards before the BF16 wrapper creates master copies) accounts for 24.203 and 12.078 GiB respectively.
+That leaves 0.348 and 0.354 GiB unassigned on this rank; dense master shards and other allocations are not separately measured.
+The DDP bucket logs are available on rank 16, so this is a rank-16 budget, not an exact per-node owner inventory.
+
+The full-depth call-259 ownership samples show 0.308 GiB of deduplicated versioned FNUZ weight storage per routed layer on node leads, or 1.846 GiB per six-layer chunk per sampled rank.
+The signed adapter populates its weight cache on first use, making these copies consistent with the extra increments on the first call of each chunk; the snapshots do not measure the full first-call increment by owner.
+The same lead samples show 0.085–0.154 GiB of saved FC1 row data and scales per layer invocation for that one backward's microbatch.
+Across PP1 detail records, all 98 signed and 41 stock observed resident-wgrad drain entries had one handoff queued, and all corresponding drain returns had zero.
+This excludes deep buildup in those sampled **host queues**, not outstanding work on GPU streams or unobserved lifetimes.
+
+From call 259 entry to return in `765130`, each node's sampled Torch allocation falls **14.87–15.16 GiB**, but reservation rises **1.50–2.15 GiB**.
+Meanwhile `active − allocated` grows **10.07–13.25 GiB/node**, to 34.94–39.94 GiB; stock A shows the same divergence (37.89–38.62 GiB at return).
+The signed run's one complete node sample at call 263 return still shows 294.69 GiB reserved: 148.23 GiB allocated, another 68.20 GiB active but not allocated, and 78.26 GiB reserved but not active.
+Zero sampled `inactive_split_bytes`, retries and Torch OOMs do not establish immediate cross-stream reuse or rule out other memory consumers.
+The active gap is consistent with delayed stream retirement, but the traces lack allocator block states, allocation sites, and free-request/completion events to identify it conclusively.
+Around call 259 the node's `Shmem` and `/dev/shm` use were flat at roughly 16.4 GiB and 7.24–7.25 GiB respectively, even as nodes sampled near-zero `MemAvailable`.
+This is separate from the later final-stage dump growth and does not identify the first fault or establish a stage-1 OOM.
+
+Next, attribute the first forwards of both chunks and their next non-first forwards by **storage owner** (attention, shared/routed MLP and dispatch, resident weight cache, and unattributed bytes) on a small number of ranks.
+Separately, at selected early and late drain boundaries, test whether a bounded allocator block-state/history sample can distinguish `active_awaiting_free` from still-owned blocks and tie free requests to the relevant streams.
+Treat any intrusive profiling as diagnostic, never as a fit or throughput run, and do not insert forced syncs or cache flushes into the reference schedule.
+No GPU job or configuration change was made for this audit.
+
+##### Stage-1 allocator diagnostic: exact launch review
+
+The [guarded declaration](../chonk-native-fnuz-pp1-allocator-i910bfcf936d3/experiment.toml) matches `765130` in training arguments, signed sources, image, topology, environment and deadlines, except for the validator instrumentation and its `APERTUS_CHONK_PP1_ALLOCATOR_TRACE=1` switch.
+The full pipeline and EP placement are necessary to reproduce the forward queue and cross-stream drain; the one-GPU KDA fixture cannot reproduce them.
+`linear_attn`, `qkv`, the signed FLA file, the native FNUZ path, the allocator configuration and the overlap schedule remain unchanged.
+
+Sample only PP1 ranks 16 and 28, one rank on each of two nodes.
+For fill calls 1, 2, 5 and 6, compare before/after block inventories and take a final fill sample after call 9.
+Classify the retained Torch blocks by allocation stack (KDA, other attention, shared experts, routed experts, routing/dispatch/combine, pipeline, or unattributed).
+Match the adapter's live row/column weight storage directly by base address and report any unmatched bytes.
+Allocation stack is not proof of the current Python owner; cache address matches are direct storage evidence.
+Other native or driver allocations outside the Torch allocator will not appear in this inventory.
+
+At drain calls 257, 259, 260 and 263, distinguish active allocations, `active_awaiting_free`, and inactive blocks, and reconcile their byte totals to the allocator counters.
+Summarize allocations, free requests/completions, and the largest pending blocks, linking addresses to recent free requests only when the recorded action and size match.
+Allocation and request stream IDs do not directly enumerate the streams whose events are still outstanding.
+Expect a first-use resident-weight increment during fill and an increase in `active_awaiting_free` during the drain if delayed reuse explains the existing active-byte gap; neither is a measurement from this job yet.
+
+The instrument takes at most 15 snapshots per rank, records Python allocation stacks only in the scoped windows, and caps drain history at 4,096 events per rank.
+PyTorch builds each whole allocator snapshot in CPU memory before the validator writes bounded JSON summaries; saturated history can miss older free requests.
+It adds no GPU waits, allocator flushes or tensor retention; history and snapshot overhead can still perturb the schedule.
+Keep early measurements or incomplete drain traces if training fails; this is not a throughput or fit-qualification run.
+The signed checkouts, retained archive members, pinned Torch snapshot API and frozen-input equality were checked offline, and 180 focused CPU tests passed.
+Reviewed guarded declaration SHA-256: `491949ba800514313d0c8f615807d4de7c1878b4ca45cbdf60c16849ac3b0161`.
+Reviewed validator SHA-256: `d635eb4007028aaa701773039c1c4cf4a1a7175ebb175365343d676919f4c8b6`.
+
+The job runs outside the agent sandbox with normal host filesystem access and `--uenv-passthrough=ignore`.
+Use 16 exclusive x86-64 Beverin `mi300` nodes in `cscs` under `csstaff`, with four GPU tasks per node, 48 CPUs per task, `map_ldom:0,1,2,3`, `block:block`, `pmix`, `disable_rdzv_get`, and all allocatable memory.
+Exclude `nid002450`; retain the 60-minute allocation, 2,700-second child bound, and 600-second identity wait.
+Recheck `cscs` capacity and the 16-node investigation cap immediately before submitting, without touching unrelated jobs.
+
+After explicit approval and exact-input verification:
+
+```bash
+cd /ritom/scratch/cscs/boeschf/apertus-amd
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-native-fnuz-pp1-allocator-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-bf16-reverse-ready \
+  --submit --gpus-per-node 4 --cpus-per-task 48 --cpu-bind map_ldom:0,1,2,3 \
+  --time 01:00:00 --cache-mode cold --exclude nid002450 --cache-image --reservation cscs
+```
+
+The cached image is `/ritom/scratch/cscs/boeschf/apertus-amd/cache/images/sha256/910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490/image.sqsh`.
+Artifacts go under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/<run-id>/`, with incremental data in `output/gpu-progress-rank-{16,28}.jsonl` and private rank caches in job-owned `/dev/shm/apertus-amd/`.
+Report at about three-minute intervals while running and promptly on failure or completion.
+No checkpoint, cache publication, deadline extension, or retry is included.
+The user approved this exact outside-sandbox launch.
+The pre-submit check found 27 eligible idle `cscs` nodes and no other investigation jobs we submitted.
+Job `765271` was submitted once, the guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/20261126T155230Z-387a1340/) is retained.
+
+###### `765271` outcome: image 910 uses a different pending-free state name
+
+The two call-1 entry snapshots reconciled exactly with the Torch allocator counters, with 24.606 and 24.431 GiB allocated on ranks 16 and 28, respectively, and zero pending-free bytes on either rank.
+Both observers received `active_pending_free` in the post-forward snapshot, while the validator expected the name `active_awaiting_free` from the pinned Python API docstring.
+Both observers recorded the error and disabled their own history collection without stopping training.
+This establishes that the pinned runtime returned a pending-free block after the first forward; the failed summaries did not retain its size or any post-forward attribution.
+Only `765271` was cancelled at 4:46 after both observers disabled themselves, and the allocation cleared.
+No drain measurements, qualified update or `checks.json` were produced; the frozen validator, partial traces and failure result were retained.
+
+For a separately approved attempt, the corrected validator maps the observed `active_pending_free` spelling to the pending-free counter while preserving the raw state and its bytes for audit.
+Unknown states still fail the observer explicitly, and snapshot totals must still reconcile to Torch counters.
+Read-only inspection of image 910's `libtorch_python.so` confirmed the literal `active_pending_free`; 182 focused CPU checks passed, including both spellings and the unknown-state case.
+Corrected validator SHA-256: `f22b1519f3adfe978e3bc503dc4f0385de46cb1df8a825e74ecf1e03e6ff8abb`.
+The command, paths, placement, workload, environment and deadlines above are unchanged; a new run requires explicit approval of the corrected validator.
+The user explicitly approved the corrected one-shot launch.
+The pre-submit check found 22 eligible idle `cscs` nodes and no other investigation jobs we submitted.
+Job `765280` was submitted once, the guard is restored, and the [corrected frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/20261126T160209Z-095f562f/) is retained separately.
+
+###### `765280` outcome: fill allocation origins and pending-free drain blocks measured
+
+Both ranks completed all nine fill snapshots with exact allocator reconciliation.
+From call 1 entry through call 9 return, live allocation increased by 38.35 GiB on rank 16 and 38.68 GiB on rank 28.
+The largest allocation-site group was routing/dispatch/combine (13.02 and 13.17 GiB), followed by resident-expert operations excluding cached weights (6.12 and 6.28 GiB) and KDA (4.38 GiB each).
+The two virtual chunks populated 3.693 GiB of resident FNUZ weight storage per rank, all matched by base address, with 1.846 GiB added at each chunk's first forward.
+The stack-based categories describe allocation origins, not the references that keep the blocks alive.
+
+At drain entry (call 257), the block snapshots showed 1.20 and 1.46 GiB awaiting free; at call 259 entry the same ranks showed 7.40 and 6.75 GiB.
+At both boundaries those blocks accounted exactly for `active − allocated` on the two sampled ranks.
+At call 259 entry, routing/dispatch/combine was the largest identifiable origin of pending blocks (1.78 and 1.63 GiB), mostly `internode_dispatch`, but 5.55 and 5.05 GiB were unattributed.
+The 4,096-entry history was full and matched recent free-request entries for 2.37 and 2.29 GiB of pending blocks.
+The retained metadata does not identify all streams that still held the blocks or prove that pending frees caused the late stall.
+
+Both allocator observers then stopped at call 259 return because the ownership hook had overwritten the observer's chunk-lookup closure with the scheduler callback itself.
+The separate ownership counters still measured `active − allocated` at call 259 return: 9.59 and 10.60 GiB on the two sampled ranks, versus 7.40 and 6.75 GiB at entry.
+Across the four stage-1 nodes, four-rank live allocation at that call fell from 222.49–223.78 to 207.61–208.65 GiB while reservation increased by 1.89–3.30 GiB per node.
+No block-level return samples or later allocator snapshots were recorded.
+At least one stage-1 node sampled zero available memory, but no HSA fault, allocator OOM, or completed update was observed before cancellation.
+Only `765280` was cancelled at 18:45; the allocation cleared and the partial results were retained.
+
+The local validator now passes one scheduler callback directly to both observers, and 182 focused CPU checks passed, including entry and return chunk IDs for call 259.
+No further run was submitted.
+
+##### Stage-1 pending-free attribution: exact launch review
+
+In `765280`, call 259 entry had 4.01/3.63 GiB of pending-free blocks with no Python allocation stack and another 1.54/1.42 GiB with an unclassified stack on ranks 16/28.
+On each rank, the twelve largest examples formed six equal-size pairs, each with one `internode_dispatch` allocation and one unclassified block.
+Size equality motivates the follow-up but is not an address or lifetime match.
+
+The guarded follow-up uses the same experiment directory and a new immutable run ID.
+Relative to `765280`, the only changed frozen inputs are the validator and `APERTUS_CHONK_PP1_LIFETIME_TRACE=1`; the repaired shared chunk callback is included.
+Keep Python allocation-state capture from the first fill call, then record a bounded 32,768-event allocator history from call 248 entry through call 263 return on ranks 16 and 28 only.
+The pinned DeepEP `internode_dispatch` and `internode_combine` wrappers annotate tensor storage addresses with input/output roles and the observed host and communication stream IDs in that late window.
+The wrappers also label allocator events generated on their calling thread, including allocations that do not return a visible tensor.
+The summary joins these labels to free requests only within the recorded address lifetime and discards them on free completion or address reuse.
+Report allocation-scope, output-role and input-use evidence separately, along with bounded raw Python frames for up to 48 pending blocks per drain snapshot.
+Report matched and unmatched bytes as fractions of the full pending-free total, and report history saturation rather than treating missing history as evidence of absence.
+An input observation is evidence of use, not allocation origin, and the recorded stream IDs do not independently prove which GPU event prevents reuse.
+Early allocations can still lack a visible stack or a generation-safe address match.
+Native-stack capture is not included and would require a separate review if the largest blocks remain unattributed.
+No GPU waits, cache flushes, or tensor-lifetime changes are added, but stack collection and annotations can perturb host timing.
+
+185 focused CPU tests passed, including address reuse, free completion, storage-role annotations and the call-259 return.
+Inspected the pinned Torch annotation API and DeepEP wrapper contract in the cached image; GPU behavior remains unverified.
+Verified the signed checkouts and archive members, unchanged workload and topology, and the read-only signed FLA mount.
+Guarded declaration SHA-256: `feef29a868fc93010b5921ffc9103ceee9208e28d583dc35d9783ceca9880db4`.
+Validator SHA-256: `2cbb04d71a1ca89f2ee94b766d20115c8532142cefa4e5389479a8428f37589a`.
+
+The exact shell command, allowlisted environment and paths are those shown in [the allocator launch review](#stage-1-allocator-diagnostic-exact-launch-review).
+It would run outside the agent sandbox with normal host filesystem access on 16 exclusive `cscs` nodes, four MI300A tasks per node and a 60-minute allocation.
+The 2,700-second child deadline, 600-second GPU identity deadline, no-checkpoint and no-cache-publication conditions are unchanged.
+There were 25 eligible idle `cscs` nodes at review; recheck the reservation and the investigation cap immediately before submission.
+The user explicitly approved the exact one-shot launch.
+At submission there were 20 eligible idle `cscs` nodes and no other investigation jobs we submitted.
+Job `765343` was submitted once, the guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/20261126T164455Z-fbb71ad3/) is retained separately.
+
+###### `765343` outcome: backward unpermute buffers identified as DeepEP combine inputs
+
+All 18 fill snapshots and nine drain snapshots reconciled exactly to the Torch allocator counters, including call 259 return on both sampled ranks.
+For the largest paired blocks at call 259 entry, raw Python frames identified one allocation as Transformer Engine `unpermute_with_mask_map` in `moe_permute_mask_map_backward`; the address-lifetime match identified its use as DeepEP combine `in.tokens`.
+The corresponding equal-size block was a separate DeepEP `internode_dispatch` output.
+The unpermute result and the dispatch result were identified by their own stacks and address records, not inferred from equal sizes.
+
+| Rank / boundary | Pending free, GiB | Newly identified TE backward unpermute, GiB | Still without an identified allocation origin, at most GiB |
+|---|---:|---:|---:|
+| 16 / call 259 entry | 7.400 | 1.530 | 1.600 |
+| 28 / call 259 entry | 7.576 | 1.599 | 1.601 |
+| 16 / call 259 return | 8.733 | 1.851 | 1.932 |
+| 28 / call 259 return | 9.033 | 1.890 | 1.932 |
+| 16 / call 263 entry | 17.392 | 3.784 | 3.636 |
+
+The unclassified bytes in the automatic summaries are reduced by the previously unclassified TE blocks identified in the bounded raw examples; the remaining quantity is an upper bound, not a full-stack census.
+At call 259 entry, existing categories plus the recovered stacks account for at least 78.37% and 78.87% of pending bytes on ranks 16 and 28.
+DeepEP address labels matched 3.317 and 3.456 GiB there, including already-classified blocks, so label totals must not be added to the origin totals.
+At call 263 entry, rank 16 had 2.927 GiB with both the TE origin and a matched combine input label, out of the 3.784 GiB identified by the TE stacks alone.
+All drain histories reached the 32,768-event cap, so an unmatched block or absent completion record does not prove the event never occurred.
+The data identifies a producer and a consumer for the matched blocks, but not the last stream event, avoidable retention, or the cause of the stall.
+
+No update completed; 32 ranks entered gradient finalization and none returned.
+All four stage-1 nodes sampled zero available memory while their `/dev/shm` peaks stayed within 7.24–7.35 GiB.
+HSA exceptions recurred on three stage-1 and eight final-stage ranks, and final-stage dump writes grew separately.
+Rank 60's child exited with `-9`; no increase in a visible cgroup OOM-kill counter was observed, so this run does not establish the cause of that exit or the first GPU fault.
+Only job `765343` was cancelled at 22:25 after the durable rank-60 failure, and the allocation cleared.
+No cache was published and no retry was submitted.
+
+###### Stage-1 last-consumer check: image-910 event and stream audit (offline)
+
+The pinned image's `/opt/alps/apertus2-rocm/source-pins.txt` identifies UCCL `52d4184c89deb5631be6dac6a9b1c40896c9e26e`.
+The in-image `ep_event.hpp` and patched `uccl_ep.cc` confirm that the native `EventHandle` binding has constructors and `current_stream_wait`, but no query or raw event-handle accessor.
+The installed `uccl/ep.abi3.so` (`fb347417de0ebbf3b0e87a514fa7896f9dd2eaa23b72fb7ba7f86cd7fed18d89`) corroborates this: the `hipEventQuery` call sites are in `Bench::sync_stream_interruptible` and `BenchFifo::sync_stream_interruptible`, not the event binding.
+Do not read the native object's private layout or infer completion from `EventOverlap.current_stream_wait()` returning.
+
+Both async internode paths wait on their existing input dependency, submit their kernels on the UCCL communication stream, and record the returned event there.
+The signed reverse paths already wait on that event on Megatron's current stream.
+The pinned Python `deep_ep.utils.EventHandle()` records on the current Torch stream by passing its pointer explicitly, unlike the bare extension's no-argument constructor.
+The image's `Buffer` passes its Torch-pool communication stream into the native runtime, so the Python and native communication stream pointers can be checked before using a same-stream marker.
+For the matched TE backward-unpermute gradient, the signed `moe_dispatch` backward routes it into BF16 DeepEP combine; the combine kernel is the last token-data reader identified in this path, not necessarily the last stream the allocator tracks.
+Image-910 `internode_combine` registers its tensors on the DeepEP communication stream and, with `allocate_on_comm_stream`, also on the caller stream.
+The cached dispatch branch used by `FusedCombine.backward` does **not** run that same Python `record_stream` tail.
+Its output passes from `moe_combine` backward to `mlp` backward; the combine output instead passes through `moe_pre_dispatch` backward (token-gradient pass-through) toward attention and routing backward.
+The schedule also records gradients on the consuming node stream and can keep gradients for delayed wgrad, so the existing DeepEP wait alone cannot establish either output's last use.
+
+At call 259 entry on each sampled rank, all nine matched TE combine-input examples reported allocator stream `0`, while all nine equal-size dispatch-output examples reported the DeepEP communication stream.
+For every one of those examples the `free_requested` stream matched the allocation stream, including the large TE inputs known to cross streams.
+The allocator source at the image-reported Torch revision `11ef10939935619f2c723ba326e3808a750a924e` writes `block->stream` in both free records, creates separate events on the recorded side streams, and retires the block only when the host processes those events.
+Thus the free record does not name the stream delaying reuse, and a pending block is not proof that its last tensor reader is still running.
+The old summaries do not capture individual allocator events or GPU completion.
+
+For the next diagnostic, target ranks 16 and 28 and calls 257–263.
+Correlate each async reverse exchange with its exact existing wait via a short-lived, non-owning association to the Python `EventOverlap` and a unique scalar exchange ID; do not retain the wrapper, native event, tensors, or `extra_tensors`.
+Use a bounded pair of new untimed markers: on the existing DeepEP stream after the exchange returns, and on the existing caller stream immediately after its original wait is enqueued.
+The first brackets the native producer event from after it on the same stream, and the second proves passage through the existing dependency when it completes.
+Neither marker is the native event, and a false or missing query does not prove the native event is incomplete.
+For outputs, use matched downstream node boundaries after the actual consumers (including delayed wgrad if it reads an alias), not just the wait as a last-use marker.
+Sample with nonblocking queries at existing host boundaries and distinguish completion observed, not ready, query/record failure, and no observation before the host stopped progressing.
+Pair scalar exchange/role annotations with the allocator record for the same storage generation and report `free_requested` and `free_completed` separately.
+Do not match by size, by address across a missing generation boundary, or by absence from a saturated ring.
+No extra GPU waits, stream-lifetime changes, allocator flush, changed timeout, or fit/throughput inference from this instrumentation.
+
+Both clean signed checkouts were reverified against `FB605768E5C3B6BE52CA4B09B5C8CB8659FA42E6`, including the pinned trees and parents, reviewed blobs, and retained archives.
+The [public key](../../artifacts/experiment-data/signers/FB605768E5C3B6BE52CA4B09B5C8CB8659FA42E6.asc) was recovered from the signer's GitHub profile, checked against the previously pinned fingerprint, and successfully used from a fresh temporary keyring.
+The existing allocator, validator, and source-freeze CPU suites passed (`155 passed`).
+No marker code was executed on GPU and no Slurm launch was submitted.
+The recipe remains guarded.
+
+###### Stage-1 completion diagnostic: exact launch review
+
+The opt-in completion probe is implemented for backward-only calls 257–263 on ranks 16 and 28.
+It keeps the existing all-buffer allocator accounting and samples at most six exchanges or consumers per boundary type per call.
+The DeepEP group covers BF16 cached-dispatch outputs, combine outputs, and combine inputs, with a separate TE backward-unpermute cohort only when the allocation stack proves that origin.
+The non-DeepEP comparison is the signed KDA backward's incoming `do` storage, excluding generations with an observed EP label.
+This comparison is bounded, not a claim that all KDA buffers have the same lifetime.
+The probe only annotates downstream gradients that are candidate aliases of sampled DeepEP outputs; the reducer requires the same retained allocation generation before treating them as consumers.
+It observes `mlp`, `moe_pre_dispatch`, and `attn` backward boundaries and delayed MLP wgrad when a sampled storage is present.
+It retains scalar metadata, diagnostic events, and only a weak reference to each native-event wrapper.
+
+Markers are untimed and queried at existing schedule boundaries without adding a wait, allocator flush, or cache purge.
+A completed marker while the generation is still awaiting free excludes ongoing work before that marker, but does not distinguish a later allocator event from delayed host retirement.
+The join drops records whose allocation event fell out of the ring and reports unmatched or unobserved work separately from completion.
+Matched allocator records and marker receipts are written incrementally, so a failed update can still provide partial diagnostic evidence.
+The probe does not extend deadlines, mutate tensor ownership, or measure fit or throughput.
+
+The pinned DeepEP signature and tuple layouts and the signed KDA `do` argument position were checked offline.
+The focused CPU batch passed (`178 passed`); these are not GPU results.
+The resolved plan and container step match job `765343` except for the opt-in environment flag and revised validator.
+The guarded recipe, validator, and site file have these reviewed SHA-256 values:
+
+| Input | SHA-256 |
+|---|---|
+| `experiments/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/experiment.toml` | `9dc906414842ce98099d74f7f8a208ccbe667bc8c76f833b1b16126413a547ce` |
+| `experiments/validation/chonk_fnuz_oom.py` | `757350228308488ee6577ade73382506872ed7e16ddfb7b13e8a08a99bcfec8c` |
+| `config.toml` | `41f3c888536d9c99332087b9d3fb80c5d1cfaa86d299bc0457b1dae998769786` |
+
+Proposed: one exclusive `csstaff` / `mi300` / `cscs` allocation, 16 MI300A nodes and four ranks per node, 48 CPUs per rank, 60-minute wall time, 2,700-second child bound, and 600-second identity deadline.
+It uses the cached image 910, cold private rank caches, `--uenv-passthrough=ignore`, and the same signed checkout and read-only KDA archive member as `765343`.
+Slurm executes the step outside the agent sandbox with normal host filesystem access; only the environment below is passed to the submission tool.
+Outputs are frozen under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/<new-run-id>/`, with job-local scratch rooted at `/dev/shm/apertus-amd`.
+At review there were 16 eligible idle `cscs` nodes and no other investigation jobs.
+Recheck eligibility and the 16-node investigation cap immediately before launch; do not switch reservations, touch other jobs, or retry automatically.
+The user approved the exact one-shot launch.
+At submission there were 16 eligible idle `cscs` nodes and no other investigation jobs.
+Job `766548` was submitted once, the launch guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/20261127T110242Z-9d09091d/) is retained separately.
+
+From `/ritom/scratch/cscs/boeschf/apertus-amd`, the exact proposed command after one-shot approval and guard removal is:
+
+```bash
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-native-fnuz-pp1-allocator-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-bf16-reverse-ready \
+  --submit --gpus-per-node 4 --cpus-per-task 48 --cpu-bind map_ldom:0,1,2,3 \
+  --time 01:00:00 --cache-mode cold --exclude nid002450 --cache-image --reservation cscs
+```
+
+###### `766548` outcome: one pending block outlived the observed consumer work
+
+The run captured 18 fill and nine drain snapshots on ranks 16 and 28, all reconciling to Torch's allocation, active, and reservation counters.
+Every drain snapshot had a full 32,768-entry history ring; the generation-matched cohorts are bounded subsets, not a census.
+At call 259 entry, ranks 16 and 28 respectively had 6.583 and 4.801 GiB pending, and none of the markers for their matched pending DeepEP generations had reported completion.
+At call 259 return, two pending blocks had a completed marker:
+
+| Rank | Buffer | Size | Progress observed before snapshot |
+|---|---|---:|---|
+| 16 | Cached dispatch output | 158.51 MiB | Producer and existing caller-wait markers completed; MLP backward and delayed wgrad markers did not. |
+| 28 | Combine output | 28.00 MiB | Producer, existing caller-wait, `moe_pre_dispatch` backward, and `attn` backward markers all completed. |
+
+This establishes that at least one block remained pending after all its tracked consumer boundaries completed.
+It does not establish whether the allocator's own events were complete, whether other work was queued on a tracked stream, or whether the block could safely have been reclaimed sooner.
+At call 263 entry on rank 16, about 6.17 GiB of the 14.043 GiB pending matched the three traced DeepEP roles, and their markers had not reported completion.
+This is not evidence that the last tensor reader was still executing: each marker is a stream boundary, not a kernel-level timer or the allocator's event.
+No KDA comparison markers were emitted, despite evidence that the signed KDA backward ran earlier, so the run does not establish whether the pattern is specific to DeepEP.
+Verify the comparison hook on the actual late backward path before proposing another comparison launch.
+These data do not support a flush or a tensor-lifetime change.
+
+No update completed; 48 ranks entered gradient finalization and none returned.
+All four stage-1 nodes sampled zero available memory while their `/dev/shm` peaks remained between 7.24 and 7.42 GiB.
+Eight final-stage ranks logged HSA exceptions, with separate late `/dev/shm` growth on the final-stage nodes.
+Rank 55's child exited with `-9` without an observed increase in the visible cgroup OOM-kill counters.
+Only job `766548` was cancelled at 23:21 after the durable rank-55 failure, and the allocation cleared.
+No cache was published and no retry was submitted.
+
+###### Stage-1 KDA comparison hook correction: exact launch review
+
+The frozen validator for `766548` installed the late comparison around the first-call signature observer.
+The first-call observer changed the module attribute back to the original signed function when it ran at call 10, bypassing both observers on later calls.
+The pinned image's `ChunkKDAFunction.backward` resolves that same module attribute and supplies `do` as a keyword.
+The ownership trace confirms that both sampled ranks reached the backward schedule for layers 26, 27, 29, 30, and 31 at calls 259 and 260, all configured for KDA.
+This was a missing observation, not evidence of no KDA work in the window.
+
+The corrected validator composes both observers in the same step-scoped hook on ranks 16 and 28, and only step cleanup restores the original signed function.
+Only the first signed invocation emits the existing provenance receipts.
+In calls 257–263 the comparison now emits an input receipt even if `do` is absent or not annotatable as a device tensor; a tagged input is paired with a marker after the original signed call returns.
+The correction does not change the original backward, precision, schedule, tensor ownership, or marker/query policy.
+The regression tests check that the first invocation at call 10 leaves the scoped hook installed and that call 259 then produces the input, marker, and query receipts.
+The focused CPU batch passed (`180 passed`); corrected GPU coverage remains untested.
+
+The corrected [validator](../validation/chonk_fnuz_oom.py) has SHA-256 `737479383be52111a4ff1598cd773038dbe7d1fe4db565d54f7cddccad54acad`.
+The guarded [recipe](../chonk-native-fnuz-pp1-allocator-i910bfcf936d3/experiment.toml) has SHA-256 `5fe437be3ec788f49a63688051e73b5f4bd8e48e0080539903eba8f227b96a50`.
+The resolved training inputs, environment, container and Slurm step match `766548` except for the revised validator; the retained signed source inputs and previous run are unchanged.
+The [exact command and paths above](#stage-1-completion-diagnostic-exact-launch-review) are unchanged; this proposal is for that command with the corrected validator digest only and a fresh run directory.
+It would run outside the agent sandbox with normal host filesystem access on one exclusive `csstaff` / `mi300` / `cscs` allocation of 16 MI300A nodes for up to 60 minutes.
+The child and identity bounds remain 2,700 and 600 seconds respectively.
+At review 32 eligible `cscs` nodes were idle and no other investigation jobs were active; recheck capacity and the 16-node investigation cap at submission.
+The user separately approved this exact one-shot launch.
+At submission there were 16 eligible idle `cscs` nodes and no other investigation jobs.
+Job `766576` was submitted once, the guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-pp1-allocator-i910bfcf936d3/20261127T115947Z-c60cbe80/) is retained separately.
+
+###### `766576` diagnostic evidence: the sampled KDA inputs did not accumulate pending frees
+
+Both comparison hooks fired in the late window: ranks 16 and 28 successfully tagged 32 and 24 KDA inputs, respectively.
+The final snapshot join matched 51 distinct KDA generations (32 and 19 by rank), all marked `free_completed`, with 0–1 µs between the two host allocator records.
+This corrects the provisional count of 62: some retained allocator timestamps varied across snapshots for the same annotation ticket, so the final count deduplicates by rank and ticket and verifies the joined address and size.
+For 46 matched generations the allocator reported `free_completed` in a snapshot where the last query had not reported marker completion, so the two signals must not be treated as interchangeable.
+This is evidence about the sampled KDA input role, not all KDA, attention, or non-DeepEP allocations.
+
+All 18 fill and ten drain allocator snapshots reconciled to the PyTorch counters.
+At call 263 return, rank 16 had 18.800 GiB awaiting free, of which 6.33 GiB matched the three sampled DeepEP roles; none of the corresponding markers had reported completion.
+At call 259 entry on rank 28, one 194.62 MiB cached-dispatch output was still awaiting free after its producer, caller-wait, MLP backward, and delayed MLP wgrad markers had all reported completion.
+This confirms the pending state can persist beyond the observed consumer work, but does not identify the allocator's remaining dependency or explain the bulk of the pending bytes.
+The bounded histories cannot establish that the rest of the backlog behaves like either cohort.
+
+No update completed; 47 ranks entered gradient finalization and none returned.
+Stage-0 ranks 4, 5, and 7 reported HSA exceptions, and the affected node's `/dev/shm` peaked at 47.94 GiB during late GPU dump activity.
+Two stage-1 nodes sampled zero available memory while stage-1 `/dev/shm` peaks stayed at 7.24–7.60 GiB.
+Rank 4's child exited with `-9` without an observed increase in the visible cgroup OOM-kill counters; the cause of that exit and the first faulting GPU operation remain unproved.
+Only job `766576` was cancelled at 23:31 after the durable rank-4 failure, and the allocation cleared.
+No cache was published and no retry was submitted.
+
+##### Offline recompute audit: attention core versus post-combine projection and sum
+
+Cross-checked the retained call-9 return snapshots for PP1 ranks 16 and 28 in `765280` and `766576` against the signed Megatron source and the installed TE Python sources in image 910.
+All four snapshots agree on the selected allocation-site byte totals.
+The stage executes 14 sliding-window attention layer-forwards and 54 MoE layer-forwards across the two virtual chunks by this boundary.
+A full-width `[4096,2,3584]` BF16 activation is 56 MiB, and the corresponding latent-width BF16 tensor is 28 MiB.
+
+**`core_attn` alone is a low-priority fit lever.**
+The existing switch checkpoints fused dot-product attention from Q/K/V, not the output gate or projection.
+The existing `qkv` replay already discards its output storages after the gate on this path.
+The CK forward allocation site accounts for 796.257 MiB per sampled rank, of which 784 MiB is consistent with 14 core outputs and 12.257 MiB with auxiliary state and allocator rounding.
+The ungated core output still feeds the output gate's backward, so the checkpoint does not remove that consumer or its need for the output.
+The auxiliary-sized remainder is the plausible direct saving suggested by the inventory, not an observed A/B delta or a hard bound on secondary effects.
+If revisited, test the real gated SWA layer with `qkv` enabled in both arms, rather than a bare CK attention kernel.
+
+**Replaying only the routed-plus-shared addition is not a good fit candidate.**
+The signed schedule retains the detached shared-expert output as a backward root, and already keeps the narrower post-communication latent buffer for the latent projection.
+The full-width projected routed tensor instead feeds a plain addition and is not a saved output of TE Linear.
+Keeping that projected tensor just to rebuild the sum would ordinarily exchange one full-width saved tensor for another.
+The pinned post-MLP RMSNorm saves its input and row statistics, so discarding its input without making it available at backward is not valid.
+
+The larger candidate is to replay **only the local latent projection and addition**, using the existing latent result and shared-expert output, and rebuild the BF16 sum for RMSNorm backward.
+Do not replay DeepEP, routing, or either expert.
+The observed sum is 54 × 56 MiB = 3,024 MiB (2.953 GiB) per sampled rank; the retained shared output and latent combine output are separate sites at 3,024 MiB and 1,512 MiB.
+That makes 2.953 GiB the visible sum budget, not a measured saving: extra retention, an activation clone, or the replay's backward peak could erase the gain.
+Start with a matched component A/B with multiple outstanding forwards, preserve the original BF16 rounding and RMSNorm, and verify both forward output and gradients including exactly one deferred latent-projection weight-gradient contribution.
+Measure end-of-fill live memory and absolute backward peak before considering full layout.
+This was a source and retained-snapshot audit only; no implementation, GPU run, or training change was made.
+
+###### Single-MI300A post-combine replay A/B: exact launch review
+
+The [guarded component probe](../chonk-post-combine-recompute-i910bfcf936d3/experiment.toml) uses the actual signed `MoELayer.postprocess`, Megatron `TELinear` with deferred wgrad, the pinned TE RMSNorm, and the signed residual-scale and dropout-add path.
+It supplies fixed BF16 latent, shared-expert, and residual tensors at the post-combine boundary instead of running a model, router, experts, or DeepEP.
+The candidate uses the signed `CheckpointWithoutOutput` to replay only the local projection and BF16 addition; TE RMSNorm and residual handling are identical in both arms.
+It drops the sum storage only after the forward RMSNorm has read it and registers its reconstruction before the norm backward through the downstream gradient hook.
+The fixture measures a single layer with four simultaneously live forwards at S4096/MBS2, latent width 1792, and hidden width 3584.
+The four sums represent a 224 MiB target in that fixture, not an assumed result.
+
+Run fresh processes in `A/B/B/A` order, three warmups and five measured trials per process.
+Require matched entry allocation, bitwise output and gradient parity for the latent input, shared input, residual input, projection weight and RMSNorm weight, and one queued then one drained projection wgrad per microbatch.
+Require lower median fill-exit allocated bytes and lower absolute backward peak in both pairings, with no increase in the maximum across forward and backward.
+Record allocated and reserved bytes separately and retain timing and memory comparisons even if a gate rejects the candidate.
+The checkpoint and backward order are tested in this fixture, not integrated into the distributed overlap schedule.
+This is not a 42-layer fit, production numerical, checkpoint, or throughput verdict.
+The fixture does not need the signed FLA override because it runs no attention.
+
+Verified the clean signed Megatron checkout's fingerprint, tree and parent and matched seven reviewed blobs to the retained archive.
+The focused CPU suite passed (`188 passed`).
+No training source was edited.
+
+| Reviewed input | SHA-256 |
+|---|---|
+| `experiments/chonk-post-combine-recompute-i910bfcf936d3/experiment.toml` | `4230d1f6bb81a6ed4efc404b263f01e286b605700458c5a19d538bc037a5659a` |
+| `experiments/validation/post_combine_recompute.py` | `2afe69ca32b9855da687a5a5afbc0d730318c6c02c8250bfdf627434c2d869ed` |
+| `config.toml` | `41f3c888536d9c99332087b9d3fb80c5d1cfaa86d299bc0457b1dae998769786` |
+
+Proposed: one exclusive x86-64 `mi300` node on `cscs` under `csstaff`, one MI300A task, 48 CPUs bound to cores, `block:block`, `pmix`, `disable_rdzv_get`, all allocatable memory, and `nid002450` excluded.
+Use pinned cached image 910, a private cold rank cache, 35-minute wall time, a 1,500-second child bound, and a 600-second GPU identity deadline.
+Image 910 and the exclusive GPU are not available inside the current sandbox; Slurm will run the job outside it with normal host filesystem access and `--uenv-passthrough=ignore`.
+The runner freezes inputs and evidence under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-post-combine-recompute-i910bfcf936d3/<run-id>/` and uses job-owned `/dev/shm/apertus-amd/` scratch.
+At review there were 16 eligible idle `cscs` nodes and no submitted investigation jobs; recheck availability and the 16-node cap before submission.
+Do not use another allocation, touch unrelated jobs, publish cache, or automatically retry.
+The user approved the exact one-shot launch.
+At submission there were 16 eligible idle `cscs` nodes and no other investigation jobs.
+Job `766673` was submitted once, the launch guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-post-combine-recompute-i910bfcf936d3/20261127T130008Z-a5f8c188/) is retained separately.
+
+Exact proposed command after separate one-shot approval:
+
+```bash
+cd /ritom/scratch/cscs/boeschf/apertus-amd
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-post-combine-recompute-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-bf16-reverse-ready \
+  --submit --gpus-per-node 1 --cpus-per-task 48 --cpu-bind cores \
+  --time 00:35:00 --cache-mode cold --exclude nid002450 --cache-image --reservation cscs
+```
+
+###### `766673` outcome: post-combine replay passed the component A/B
+
+Slurm completed cleanly in 2:07 and the allocation cleared.
+All four fresh processes completed five warm samples each, and both ABBA pairings had identical allocated-memory deltas.
+The output and all five gradient tensors per microbatch matched bitwise, and each backward queued and drained exactly one delayed projection wgrad.
+The replay arm ran the local projection and add once per backward and did not replay RMSNorm.
+
+| Median memory (MiB) | Baseline | Replay | Change |
+|---|---:|---:|---:|
+| Fill-exit allocated | 1,276.382 | 1,052.382 | −224.0 |
+| Forward peak allocated | 1,332.382 | 1,164.382 | −168.0 |
+| Backward peak allocated, also the overall peak | 1,456.857 | 1,304.357 | −152.5 |
+| Overall peak reserved | 1,462.0 | 1,322.0 | −140.0 |
+
+Isolated backward took 1.62–2.05 ms longer per four-microbatch drain across the two pairings; this is not a training throughput measurement.
+The component result justifies reviewing a signed schedule integration that preserves stream ordering and drains the projection wgrad exactly once.
+It does not establish distributed memory savings or full-depth fit.
+No training source changed, no cache was published, and no follow-up run was submitted.
+
+###### Post-combine schedule replay: signed handoff
+
+Worktree: `/ritom/scratch/cscs/boeschf/megatron/amd-chonk-post-combine-recompute`.
+Branch: `experiment/amd-chonk-post-combine-recompute`.
+Sole parent: signed `041c1d753028e4190efb342accb98a6f362ee7dd`.
+Expected tree: `d10bc1e1e764cd5da916011a32bb895071aea5b3`.
+Suggested signed subject: `Replay local BF16 MoE post-combine projection and add`.
+
+| Reviewed file | Expected Git blob |
+|---|---|
+| `megatron/core/models/gpt/fine_grained_callables.py` | `ef7ba17a5b8e1d4708efac59f929b6049d7bdd52` |
+| `megatron/core/transformer/moe/moe_layer.py` | `aa30179482133508d184355164c9ef6443ae2800` |
+| `megatron/core/transformer/transformer_config.py` | `811fc00891f6de87bbfaef96a3fb40a9f951e30c` |
+| `tests/test_utils/python_scripts/qualify_post_combine_replay_schedule.py` | `a1db1153685e312f0000ee071c133346ee94e79e` |
+
+`--moe-recompute-post-combine` defaults off and admits only the eager TP1 BF16 native FNUZ overlap path with non-overlapped shared experts and separate sandwich RMSNorm.
+The original forward resolves the dispatcher's reshape before saving the latent input, because a later microbatch can overwrite the dispatcher shape.
+Each differentiable training forward has its own checkpoint instance, which replays only the BF16 latent projection and add.
+The hook attaches to the normalized/scaled result so the saved sum storage is rebuilt before RMSNorm backward.
+`moe_post_combine` still runs on the communication stream, before reverse combine, and the MLP node still drains the delayed projection wgrad through `MoELayer.backward_dw`.
+No new stream waits, manual gradient releases, allocator flushes, precision changes, or collective/expert replay were added.
+
+The focused CPU suite passed (192 tests including four offline source checks), the schedule fixture compiled without executing, and the readiness baseline remains clean.
+The local schedule fixture uses the real schedule and nodes with TE BF16 projection and RMSNorm, four live forwards and a fifth interleaved with the first backward.
+It checks sum discard/restore, one dispatcher reshape per forward, one queue/drain per backward, communication-stream placement, and bitwise output and five-gradient parity with synthetic boundary tensors.
+It has not run on GPU and does not exercise native collectives, routed GEMMs, or DDP gradient reduction.
+
+After user signing, verify the clean checkout, signer `FB605768E5C3B6BE52CA4B09B5C8CB8659FA42E6`, sole parent, exact tree/blobs, and frozen archive before requesting approval for an exact GPU launch.
+For a full-layout diagnostic, keep the signed FLA and ready DeepEP stack, private CK builds/copies, full optimizer and topology, and match the retained PP1 fill/drain boundary labels.
+Measure allocated and reserved bytes separately, verify actual replay and the delayed projection wgrad lifecycle, and record absolute backward peaks without treating the pending-free backlog as available memory.
+The 2.95 GiB/GPU estimate applies to fill exit, not backward peak or full-depth fit.
+No run is authorized or submitted by this handoff.
+
+###### Signed post-combine schedule A/B: exact launch review
+
+Verified user-signed Megatron commit `2988ed82702cb97eef6e23c1cfa263c69f594d9a` in the clean dedicated worktree against the pinned signer, sole parent, expected tree and all four reviewed blobs above.
+The [retained archive](../../artifacts/experiment-data/sources/2988ed82702cb97eef6e23c1cfa263c69f594d9a/) was verified against the reviewed blobs; all other regular-file manifest entries match the retained readiness baseline.
+
+| Reviewed input | SHA-256 |
+|---|---|
+| Retained `source.tar` | `d6ddcfaa036b6be5d0ca3dd691e20d83cc7061b252f31614f3605ffc86563348` |
+| Retained `manifest.json` | `6b8165598bf892c22ea847d7e8b08e3ada3cc53b23bfb71b06b4d3e238bb5090` |
+| Guarded [experiment declaration](../chonk-post-combine-schedule-i910bfcf936d3/experiment.toml) | `2d799e77a436da1b86ebf03bfd3f3fc86349aacf3c1e022187818063bff8bf78` |
+| [Validator](../validation/post_combine_schedule.py) | `77652dd20f24d40a1ac9636197a68a10ca7b4b53acb6f2c4fc6a098e2b4b52cf` |
+| Site `config.toml` | `41f3c888536d9c99332087b9d3fb80c5d1cfaa86d299bc0457b1dae998769786` |
+
+Run the signed local fixture's A/B with four live forwards and a fifth forward interleaved with the first backward.
+Require bitwise parity for the output and five gradients, one dispatcher reshape per original forward, discarded storage restored before RMSNorm backward, replay on the communication stream, and exactly one deferred projection wgrad queued and drained per backward.
+A successful process and verified source imports are required in addition to the fixture's unique terminal pass marker.
+This is a schedule check with synthetic boundaries; it does not run collectives, routed experts, DDP reduction, an optimizer update or FLA, and has no distributed fit or throughput gate.
+198 focused CPU checks passed; the signed GPU fixture has not run.
+
+Proposed: one new exclusive x86-64 Beverin `csstaff` / `mi300` node on `cscs`, one MI300A rank, 48 CPUs bound to cores, all allocatable memory, `block:block`, `pmix`, `disable_rdzv_get`, and `nid002450` excluded.
+The pinned cached image 910 and exclusive GPU are not available inside the agent sandbox; the Slurm task runs outside it with normal host filesystem access and `--uenv-passthrough=ignore`.
+Use a 35-minute allocation, a 1,500-second fixture child bound, a 600-second GPU identity bound, and a private cold rank cache in job-owned `/dev/shm/apertus-amd/`.
+The runner reads the retained source archive, freezes the resolved inputs, and retains receipts and logs under `artifacts/experiment-data/runs/chonk-post-combine-schedule-i910bfcf936d3/<run-id>/`.
+The submission shell uses the explicit environment below; the rank environment uses the reviewed declaration and site settings.
+There were 32 eligible idle `cscs` nodes and no other investigation jobs at review; recheck capacity and the 16-node investigation cap before launch.
+The guarded declaration must stay blocked until exact one-shot approval; restore its guard immediately after the attempt.
+Do not use the unrelated interactive allocation, publish cache, retry, or extend the deadline.
+Report promptly on failure/completion and about every three minutes while running.
+
+Exact proposed command after separate approval:
+
+```bash
+cd /ritom/scratch/cscs/boeschf/apertus-amd
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-post-combine-schedule-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-post-combine-recompute \
+  --submit --gpus-per-node 1 --cpus-per-task 48 --cpu-bind cores \
+  --time 00:35:00 --cache-mode cold --exclude nid002450 --cache-image --reservation cscs
+```
+
+The user explicitly approved the exact one-shot launch.
+At submission there were 32 eligible idle `cscs` nodes and no other investigation jobs.
+Job `766681` was submitted once, the launch guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-post-combine-schedule-i910bfcf936d3/20261127T133349Z-40a78e3e/) is retained separately.
+
+###### `766681` outcome: signed local schedule A/B passed
+
+Slurm accounting reported `COMPLETED` in 1:14 with exit `0:0`, and the rank receipt confirmed cleanup and 202 verified Megatron imports.
+All five local schedule microbatches passed bitwise output and five-gradient parity, including the fifth forward interleaved with the first backward.
+The signed fixture confirmed that the dispatcher reshape ran only in forward, replay restored the discarded sum before RMSNorm backward on the communication stream, and the existing MLP drain handled exactly one queued projection wgrad per backward.
+The private cache was cold and no cache was published.
+This passes the local schedule gate with synthetic boundaries, not the distributed, 42-layer fit, or throughput gates.
+No follow-up job was submitted.
+
+###### Full-layout post-combine replay: exact launch review
+
+The [guarded diagnostic](../chonk-native-fnuz-post-combine-i910bfcf936d3/experiment.toml) requests one cold full Swiss-AI update: 42 layers, S4096/MBS2/GBS4096, TP1/PP4/VPP2/EP16/ETP1/CP1/DP16/EDP1 and the layer-wise `md_decoupling` optimizer.
+The arguments are byte-for-byte the retained `766576` list plus `--moe-recompute-post-combine`.
+Keep signed Megatron `2988ed82702cb97eef6e23c1cfa263c69f594d9a`, the complete signed FLA `6c70d55a71e7fb4fca7de990015f6a3046193762` backward member, native FNUZ, native P2P, delayed wgrad, overlapped gradient reduction and the existing TE/CK route.
+Require one verified CK build per node and exact private rank copies, with no shared cache publication.
+The 600-second UCCL CPU polling allowance is unchanged; GPU deadlines are unchanged.
+Compared with `766576`, the diagnostic removes the notification, dependency, P2P, stall, ownership and PP1 allocator-history/completion observers.
+It keeps lightweight schedule snapshots, host telemetry, and gradient-finalization and optimizer entry/exit markers.
+It does not add GPU waits, allocator flushing or stream-lifetime changes.
+
+At PP1 call 9 return `(f=8,b=None)`, require 54 armed replay checkpoints per rank and record allocated and reserved bytes separately.
+Compare against the observed matched `766576` boundaries, without filling in missing samples or treating four-rank sums as simultaneous node measurements.
+The baseline PP1 fill-exit allocated sums were 251.985, 253.677, 252.788 and 252.989 GiB across the four logical nodes.
+Reset only the allocator peak counters at the first backward-containing call; record absolute allocated and reserved peaks through the final backward call, including any interleaved forwards in that window.
+Preserve cumulative high-water marks for historical comparison; the historical baseline did not isolate a backward-phase peak.
+Preserve partial receipts on failure.
+Require one finite, unskipped update on all 64 ranks, signed KDA/CK/native-CXI evidence, and 128 matched post-combine forward/replay/deferred projection drains per routed layer per rank.
+No checkpoint, shared cache, retry, deadline extension or throughput verdict is in scope.
+
+206 focused CPU checks passed, including the historical workload match, exact delayed-wgrad lifecycle, peak and partial-run comparison gates.
+Both signed source checkouts and retained archives were verified.
+
+| Reviewed input | SHA-256 |
+|---|---|
+| Guarded `experiment.toml` | `5aa7c2aaf9239cbb7be636e34dfb9b9133a2b61df7c7b7182d76e302f6474183` |
+| `experiments/validation/chonk_fnuz_oom.py` | `da8770f110d96762a1e3479335bb342fcab14f1d69fefab3df1f91ac03531cc8` |
+| Site `config.toml` | `41f3c888536d9c99332087b9d3fb80c5d1cfaa86d299bc0457b1dae998769786` |
+| `766576` retained `resolved.json` | `7dfe214bcf3aef06968d81f3a7afdfe39f9ae48a8d7c93d6feaaf5ad3a24235e` |
+
+Proposed: 16 exclusive x86-64 Beverin `csstaff` / `mi300` nodes on `cscs`, 64 MI300A ranks, 48 CPUs per rank, all allocatable memory, `map_ldom:0,1,2,3`, `block:block`, `pmix`, `disable_rdzv_get`, with `nid002450` excluded.
+This pinned image and full topology cannot run inside the agent sandbox or its existing single-node allocation.
+Slurm will run outside the agent sandbox with normal host filesystem access and `--uenv-passthrough=ignore`.
+Keep the 60-minute allocation, the 2,700-second child bound, 600-second GPU identity wait, cached image 910 and cold private rank caches.
+The runner freezes inputs and records under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-post-combine-i910bfcf936d3/<run-id>/` and uses job-owned scratch under `/dev/shm/apertus-amd`.
+At review there were 32 eligible idle `cscs` nodes and no other investigation jobs.
+Recheck capacity and the 16-node investigation cap immediately before submission, restore the one-shot guard after the attempt, and leave unrelated jobs untouched.
+Report about every three minutes while running and promptly on failure or completion.
+
+Exact proposed command after explicit one-shot approval:
+
+```bash
+cd /ritom/scratch/cscs/boeschf/apertus-amd
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-native-fnuz-post-combine-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-post-combine-recompute \
+  --submit --gpus-per-node 4 --cpus-per-task 48 --cpu-bind map_ldom:0,1,2,3 \
+  --time 01:00:00 --cache-mode cold --exclude nid002450 --cache-image --reservation cscs
+```
+
+The user explicitly approved this exact one-shot launch.
+At submission there were 32 eligible idle `cscs` nodes and no other investigation jobs.
+Job `766684` was submitted once, the launch guard is restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-post-combine-i910bfcf936d3/20261127T134744Z-e8fed5d0/) is retained separately.
+
+###### `766684` outcome: distributed fill savings confirmed, update not qualified
+
+All 16 PP1 ranks reached call 9 exit with 54 checkpoints armed per rank and no replay or drain yet.
+Relative to `766576`, allocated memory fell **2.949–2.957 GiB per GPU** and reserved memory fell **2.812–2.949 GiB per GPU**.
+The four logical PP1 node allocation sums fell from **251.985–253.677 GiB** to **240.178–241.861 GiB**, saving about **11.81 GiB per node**.
+These are sums at matching logical positions, not simultaneous measurements.
+At call 259 exit all 16 PP1 ranks still showed **1.964–1.974 GiB** lower current allocation, while reserved memory ranged from **2.381 GiB lower to 0.256 GiB higher**.
+The 15 PP1 ranks that returned from their final backward schedule call recorded **64.012–65.238 GiB allocated** and **71.672–75.010 GiB reserved** as absolute backward-window peaks.
+The retained baseline did not isolate this window, so those ranges are not a backward-peak saving.
+The [matched comparison](../../artifacts/experiment-data/runs/chonk-native-fnuz-post-combine-i910bfcf936d3/20261127T134744Z-e8fed5d0/pp1-matched-memory-comparison.json) preserves missing baseline or candidate rows explicitly.
+
+All 64 ranks verified private CK reuse and returned from the signed FLA backward path.
+63 ranks reached the final schedule return with 128 forwards, 128 replays and 128 delayed projection drains per local routed layer.
+Rank 27 last returned from call 264 (`b=254`) and entered call 265 without a return.
+60 ranks entered gradient finalization and none returned; no rank reached the optimizer step or reported a completed update.
+PP3 ranks 48, 49, 50, 52, 53 and 54 reported HSA queue hardware exceptions after their last durable host boundary.
+The fault notifications are asynchronous and do not identify the first faulting operation or establish that gradient finalization, replay, or memory pressure caused it.
+Only job `766684` was cancelled, at 21:58 elapsed, after the queue exceptions and lack of finalization progress.
+The one-shot guard remains in place; no retry, cache publication, or deadline change was made.
+The observed distributed memory saving stands, but full-depth training, checkpoint/restart and throughput remain unqualified.
+The next diagnostic should isolate the late failure with existing gradient-sync/collective boundaries or fault evidence rather than rerun this recipe unchanged.
+
+###### Full-layout replay with three additional node exclusions: exact launch review
+
+The user requested a one-shot placement comparison against `766684`, not a change to the training or diagnostic code.
+Keep the original `nid002450` exclusion and add `nid002932` (PP1 ranks 24–27, all without a gradient-finalization entry) and `nid002966` and `nid002968` (PP3 nodes that reported HSA queue exceptions).
+The hostnames were verified against the retained node and rank receipts.
+`nid002932` also hosted ranks 24–27 in the successful 24-layer control `764651`; the exclusions test a different placement, not a finding of faulty hardware.
+Compare matched logical schedule boundaries and finalization progress to `766684`, keeping the original artifacts immutable.
+Even a successful run would not identify which host, if any, caused the earlier failure.
+
+The resolved plan matches `766684` except for `resources.exclude` and the one-shot guard, which stays in place pending exact approval.
+The existing recipe, validator and runner files match the reviewed run; the signed Megatron and FLA inputs, image 910, workload, private cold caches, allocation limits and child deadlines are unchanged.
+At review there were 29 eligible idle `cscs` nodes after exclusions and no other investigation jobs.
+Recheck availability and the 16-node cap at submission.
+Use 16 exclusive Beverin `csstaff` / `mi300` nodes on `cscs`, with 64 ranks, 48 CPUs per rank, all allocatable memory, `map_ldom:0,1,2,3`, `block:block`, `pmix`, and `disable_rdzv_get`.
+The full topology is unavailable inside the agent allocation; Slurm will run outside the agent sandbox with normal host filesystem access and `--uenv-passthrough=ignore`.
+Write a new run under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-post-combine-i910bfcf936d3/<new-run-id>/`, using job-owned `/dev/shm/apertus-amd` scratch.
+No checkpoint, cache publication, automatic retry, or deadline extension is included.
+
+Exact proposed command after separate approval, with the original guard restored after the one-shot attempt:
+
+```bash
+cd /ritom/scratch/cscs/boeschf/apertus-amd
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-native-fnuz-post-combine-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-post-combine-recompute \
+  --submit --gpus-per-node 4 --cpus-per-task 48 --cpu-bind map_ldom:0,1,2,3 \
+  --time 01:00:00 --cache-mode cold --exclude nid002450,nid002932,nid002966,nid002968 \
+  --cache-image --reservation cscs
+```
+
+The user approved this exact one-shot placement comparison.
+At submission there were 29 eligible idle `cscs` nodes after exclusions and no other investigation jobs.
+Job `766731` was submitted once, the guard was restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-post-combine-i910bfcf936d3/20261127T142124Z-8a6dbcde/) is retained separately.
+
+###### `766731` outcome: first finite, unskipped 42-layer update
+
+Slurm completed in **17:53** with exit `0:0` and the allocation cleared.
+The frozen inputs differed from `766684` only by run ID and the approved exclusion list, and none of the four excluded hosts was allocated.
+All **64 ranks** completed gradient finalization and the optimizer step, and the frozen validator passed one finite, unskipped update.
+Every rank verified the signed FLA path and reuse of its private node-qualified CK object.
+Each local routed layer recorded 128 post-combine replays and 128 delayed projection wgrad drains per rank.
+The gradient norm was **2.683361769** on all 64 ranks, and LM loss was **12.707279205** on all 16 final-stage ranks.
+Gradient-finalization host spans were **3.29–11.94 s**; cold update host spans were **891.67–891.85 s**, not steady-state throughput.
+No HSA queue exception, DeepEP timeout, or HIP OOM was reported in the rank logs.
+
+All 16 PP1 ranks reproduced the fill-exit win with 54 checkpoints armed per rank.
+The [offline placement comparison](../../artifacts/experiment-data/runs/chonk-native-fnuz-post-combine-i910bfcf936d3/20261127T142124Z-8a6dbcde/pp1-fill-exit-placement-comparison.json) records **2.947–2.957 GiB/GPU** lower allocated memory versus `766576` and within **9 MiB/GPU** of `766684`.
+PP1 absolute backward-window peaks were **64.004–65.244 GiB allocated** and **69.643–76.963 GiB reserved** per GPU.
+The no-replay baseline did not isolate this window, so these are not measured backward-peak savings.
+This is one accepted full-depth update on the tested placement, not proof that any excluded node was faulty or that results generalize across placements.
+The next gate is synchronous distributed `torch_dist` checkpoint/restart, followed by portable cache reuse and the unprofiled warm throughput repeats.
+No checkpoint, shared cache generation, or follow-up job was created.
+
+###### Full-layout synchronous `torch_dist` save: exact launch review
+
+Split the checkpoint/restart gate into two independent allocations so a failed save does not launch a restart and the restart can only select the exact accepted checkpoint.
+This approval is for the **save only**.
+The [guarded save recipe](../chonk-native-fnuz-sync-save-i910bfcf936d3/experiment.toml) adds `--save-interval 1 --ckpt-staging streamed` and a runner-owned `--save` path to `766731`.
+The pinned synchronous writer transfers one tensor at a time to pageable CPU memory for serialization instead of preloading the whole shard into pinned memory.
+This changes checkpoint staging only; there is no training host offload, async save, extra GPU wait, or retry.
+The 42-layer workload, optimizer, native FNUZ, signed Megatron and FLA, image 910, cold private CK artifacts and node exclusions are unchanged.
+
+Require one finite, unskipped update on all 64 ranks followed by exactly one synchronous save at iteration 1 with 4,096 consumed samples.
+Require native state-generation receipts for both model chunks, optimizer, scheduler and RNG, and a returned save boundary on every rank.
+Check the iteration tracker, backend, shard inventory and all metadata storage extents; hash the sidecars without reading the entire tensor payload on rank zero.
+The accepted output must be retained for the next job, which will verify actual restore and a finite, unskipped update 2.
+This save check by itself does not establish tensor restoration or numerical equivalence after restart.
+No shared compiler-cache publication is in scope.
+
+**209 focused CPU checks passed.**
+The signed sources, archives and plan comparison against `766731` were verified.
+The checkpoint will be under the new run's `output/checkpoints/` on shared `/ritom` scratch, not in job-local `/dev/shm`.
+The quota service's Nov 20 snapshot reported 41.9 TiB used of 272.8 TiB on the user's `/ritom` scratch, with ample room for a checkpoint on the order of a terabyte; this is not a measured checkpoint size.
+
+| Reviewed input | SHA-256 |
+|---|---|
+| Guarded save `experiment.toml` | `2bb98e587e28128d677771a3a488decbddad09bab583d3ebbaa1f9be7d4b7b1f` |
+| `experiments/validation/chonk_fnuz_oom.py` | `04e7fcbb512f36be9fb3c508cc77cec83183d446d725d0831c722c0aae938dc7` |
+| Site `config.toml` | `41f3c888536d9c99332087b9d3fb80c5d1cfaa86d299bc0457b1dae998769786` |
+| `766731` retained `resolved.json` | `15fa1afabab63f95606e055e32b297279d959d6245e3937c4e03448720dd6a19` |
+
+The exact request is 16 exclusive x86-64 Beverin `csstaff` / `mi300` nodes on `cscs`, four GPU ranks per node, 48 CPUs per rank, all allocatable memory, `map_ldom:0,1,2,3`, `block:block`, `pmix`, `disable_rdzv_get`, the tested exclusion list and `--uenv-passthrough=ignore`.
+Keep the 60-minute allocation, 2,700-second rank child bound and 600-second GPU identity wait.
+The full topology and pinned container require Slurm outside the agent sandbox with normal host filesystem access; the submission environment is explicitly allowlisted below.
+The runner freezes inputs and records under `/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/runs/chonk-native-fnuz-sync-save-i910bfcf936d3/<run-id>/`, with private job scratch under `/dev/shm/apertus-amd`.
+At review, 29 eligible `cscs` nodes were idle after exclusions and there were no investigation jobs.
+Recheck capacity and the 16-node cap before submission, restore the guard after the one-shot attempt, and report about every three minutes or promptly on failure or completion.
+
+Exact proposed save command after separate approval:
+
+```bash
+cd /ritom/scratch/cscs/boeschf/apertus-amd
+uv run --locked /usr/bin/env -i \
+  HOME=/ritom/scratch/cscs/boeschf/apertus-amd/artifacts/experiment-data/pyxis-home-fnuz.Cjg8lEOV \
+  USER=boeschf LOGNAME=boeschf PATH=/usr/bin:/bin SCRATCH=/ritom/scratch/cscs/boeschf \
+  /ritom/scratch/cscs/boeschf/apertus-amd/.venv/bin/apertus run \
+  experiments/chonk-native-fnuz-sync-save-i910bfcf936d3 \
+  --checkout /ritom/scratch/cscs/boeschf/megatron/amd-chonk-post-combine-recompute \
+  --submit --gpus-per-node 4 --cpus-per-task 48 --cpu-bind map_ldom:0,1,2,3 \
+  --time 01:00:00 --cache-mode cold --exclude nid002450,nid002932,nid002966,nid002968 \
+  --cache-image --reservation cscs
+```
+
+The user approved this exact save-only launch.
+At submission there were 29 eligible idle `cscs` nodes after exclusions and no other investigation jobs.
+Job `766741` was submitted once, the guard was restored, and the [frozen run](../../artifacts/experiment-data/runs/chonk-native-fnuz-sync-save-i910bfcf936d3/20261127T144824Z-28413158/) is retained separately.
+No restart was submitted.
+
 #### Reduced 24-layer dense-head probe: launch review
 
 The user requested a reduced-depth run before investigating the full-layout stall.

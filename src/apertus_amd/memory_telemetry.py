@@ -1,9 +1,12 @@
 """Low-rate Linux process and node memory telemetry for bounded source probes."""
 
+from collections import deque
+from itertools import islice
 import json
 import os
 from pathlib import Path
 import re
+import stat
 from time import time_ns
 
 
@@ -102,7 +105,81 @@ def mapping_snapshot(pid, proc=Path("/proc"), minimum_kib=128 * 1024, limit=32):
     return dict(status="sampled", candidate_count=len(rows), minimum_kib=minimum_kib, mappings=rows[:limit])
 
 
-def sample(stream, pid, *, node_lead, event, mappings=False):
+def scratch_inventory(root, pids, *, include_tree, proc=Path("/proc"), limit=4096, keep=16):
+    """Sample only job scratch and visible child descriptors; never open file contents."""
+    inode_rows, covered, errors = {}, 0, 0
+    truncated = False
+    pending = deque([root]) if include_tree else deque()
+    root_device = root.stat().st_dev
+
+    def add(path, metadata, *, deleted=False):
+        if metadata.st_dev != root_device or not stat.S_ISREG(metadata.st_mode):
+            return
+        key = (metadata.st_dev, metadata.st_ino)
+        if key in inode_rows:
+            return
+        name = path.name
+        tag = ("dump_like" if name.startswith(("core", "gpucore")) or name.endswith(".gpu")
+               else "rank_cache" if any(part.startswith("cache-") for part in path.parts)
+               else "other")
+        inode_rows[key] = dict(path=str(path), device=key[0], inode=key[1], tag=tag,
+                               bytes=metadata.st_blocks * 512, deleted=deleted)
+
+    while pending and covered < limit:
+        directory = pending.popleft()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if covered >= limit:
+                        truncated = True
+                        break
+                    covered += 1
+                    try:
+                        meta = entry.stat(follow_symlinks=False)
+                        if meta.st_dev == root_device and stat.S_ISDIR(meta.st_mode):
+                            pending.append(Path(entry.path))
+                        elif stat.S_ISREG(meta.st_mode):
+                            add(Path(entry.path).relative_to(root), meta)
+                    except OSError:
+                        errors += 1
+        except OSError:
+            errors += 1
+    truncated |= bool(pending)
+
+    fd_count = 0
+    truncated |= len(pids) > 32
+    for pid in islice(pids, 32):
+        try:
+            with os.scandir(proc / str(pid) / "fd") as fds:
+                for fd in fds:
+                    if fd_count >= min(limit, 1024):
+                        truncated = True
+                        break
+                    fd_count += 1
+                    try:
+                        target = os.readlink(fd.path)
+                        deleted = target.endswith(" (deleted)")
+                        path = Path(target.removesuffix(" (deleted)"))
+                        if path.is_absolute() and ".." not in path.parts and path.is_relative_to(root):
+                            add(path.relative_to(root), fd.stat(), deleted=deleted)
+                    except OSError:
+                        errors += 1
+        except OSError:
+            errors += 1
+        if fd_count >= min(limit, 1024):
+            break
+
+    totals = {}
+    for row in inode_rows.values():
+        tag = f"{row['tag']}:deleted" if row["deleted"] else row["tag"]
+        totals[tag] = totals.get(tag, 0) + row["bytes"]
+    largest = sorted(inode_rows.values(), key=lambda row: row["bytes"], reverse=True)[:keep]
+    return dict(status="partial" if truncated or errors else "sampled", tree=include_tree,
+                entries=covered, descriptors=fd_count, errors=errors, truncated=truncated,
+                bytes_by_tag=totals, largest=largest)
+
+
+def sample(stream, pid, *, node_lead, event, mappings=False, scratch=None):
     """Append one flushed observation from the supervisor, not the training child."""
     row = dict(unix_ns=time_ns(), event=event, pid=pid, process_tree=process_tree(pid))
     if node_lead:
@@ -124,4 +201,12 @@ def sample(stream, pid, *, node_lead, event, mappings=False):
     if mappings:
         row["vm_mapping"] = mapping_snapshot(pid)
         row["vm_mapping_end_unix_ns"] = time_ns()
+    if scratch is not None:
+        try:
+            row["scratch_inventory"] = scratch_inventory(scratch, row["process_tree"], include_tree=node_lead)
+        except OSError as exc:
+            row["scratch_inventory"] = dict(status="unavailable", error=type(exc).__name__)
+        if node_lead:
+            row["kernel_core_pattern"] = text(Path("/proc/sys/kernel/core_pattern"))
+        row["scratch_inventory_end_unix_ns"] = time_ns()
     print(json.dumps(row, separators=(",", ":")), file=stream, flush=True)

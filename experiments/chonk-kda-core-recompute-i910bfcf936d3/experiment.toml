@@ -1,0 +1,42 @@
+# One real Megatron KDA sublayer; A/B changes only its outer core checkpoint.
+nodes = 1
+entrypoint = "megatron/core/ssm/kimi_delta_attention.py"
+args = []
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "041c1d753028e4190efb342accb98a6f362ee7dd"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+KDA_ALOG_PER_CHANNEL = "0"
+KDA_USE_GATE_IN_KERNEL = "1"
+KDA_FUSED_GATE = "1"
+KDA_QK_L2NORM_IN_KERNEL = "1"
+KDA_CONV1D_CUDA = "1"
+KDA_FUSED_LOW_RANK_GATHER = "1"
+TORCH_COMPILE_DISABLE = "0"
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+OMP_NUM_THREADS = "18"
+MAX_JOBS = "1"
+TORCHINDUCTOR_COMPILE_THREADS = "1"
+CMAKE_BUILD_PARALLEL_LEVEL = "1"
+MAKEFLAGS = "-j1"
+
+[procedure]
+kind = "probe"
+timeout = 1500
+gpu_identity_timeout = 600
+startup_trace = true
+validation = "../validation/kda_core_recompute.py"
+launch_blocked = "Corrected one-shot MI300A KDA core recompute A/B submitted as job 765143; no further launch is authorized."
+
+[procedure.auxiliary_source]
+commit = "6c70d55a71e7fb4fca7de990015f6a3046193762"
+manifest_sha256 = "6c383647a70e2c6f0b0fc13f14cd5e0ef6e95ca6d3b34d3e7ecdfdf7e1ba6c1b"
+path = "fla/ops/kda/chunk_bwd.py"
+sha256 = "79d34bd5711a71e455a6b0346085c9431f5b224a5766ed839468a8902ead0e21"

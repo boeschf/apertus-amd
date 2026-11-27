@@ -1,8 +1,14 @@
 """Stream full-layout schedule and device memory evidence before a possible kill."""
 
+from collections import Counter
 from contextlib import contextmanager
 from functools import wraps
+from hashlib import sha256 as sha256_bytes
+from heapq import heappush, heapreplace
 import importlib
+import importlib.abc
+import importlib.metadata
+import importlib.util
 from inspect import unwrap
 import json
 import math
@@ -16,6 +22,7 @@ import subprocess
 import sys
 from threading import Event as ThreadEvent, Lock, Thread
 from time import monotonic, monotonic_ns, time_ns
+from weakref import ref
 
 from apertus_amd.artifacts import sha256, write_json
 from apertus_amd.config import CACHE_PATHS, option
@@ -27,6 +34,7 @@ SEQ, MBS = 4096, 2
 GEOMETRY = dict(tensor_model=1, pipeline_model=4, virtual_pipeline_model=2,
                 expert_model=16, expert_tensor=1, context=1, data=16, expert_data=1)
 COMPILE_THREADS = 4
+SERIAL_BUILD_ENV = {"MAX_JOBS": "1", "CMAKE_BUILD_PARALLEL_LEVEL": "1", "MAKEFLAGS": "-j1"}
 TRACE_RANKS = range(48, WORLD)
 TRACE_CALL_LIMIT = 8
 HEAD_CHUNK = 512
@@ -42,6 +50,37 @@ REDUCED_LAYOUT = "Ettt|(ttt|)*6,tttL"
 REDUCED_KDA = "([1,1,1,0]*6)"
 REDUCED_MOE = "([0]*3+[1]*21)"
 REDUCED_DRAIN_TRACE = "APERTUS_CHONK_REDUCED_DRAIN_TRACE"
+OWNERSHIP_TRACE = "APERTUS_CHONK_OWNERSHIP_TRACE"
+PP1_ALLOCATOR_TRACE = "APERTUS_CHONK_PP1_ALLOCATOR_TRACE"
+PP1_LIFETIME_TRACE = "APERTUS_CHONK_PP1_LIFETIME_TRACE"
+PP1_COMPLETION_TRACE = "APERTUS_CHONK_PP1_COMPLETION_TRACE"
+POST_COMBINE_FLAG = "--moe-recompute-post-combine"
+POST_COMBINE_FIELD = "moe_recompute_post_combine"
+POST_COMBINE_SOURCE = "2988ed82702cb97eef6e23c1cfa263c69f594d9a"
+POST_COMBINE_TREE = "d10bc1e1e764cd5da916011a32bb895071aea5b3"
+POST_COMBINE_ARCHIVE = "d6ddcfaa036b6be5d0ca3dd691e20d83cc7061b252f31614f3605ffc86563348"
+POST_COMBINE_MANIFEST = "6b8165598bf892c22ea847d7e8b08e3ada3cc53b23bfb71b06b4d3e238bb5090"
+POST_COMBINE_ARGS = "2c6914ef575d19938376a5869830b82fa770ab7761c29312b6e00d609a57c267"
+SYNC_SAVE_ARGS = ("--save-interval", "1", "--ckpt-staging", "streamed")
+SYNC_SAVE_STATE = {"model0", "model1", "optimizer", "opt_param_scheduler", "rng_state"}
+FULL_LAYOUT = "Ettt|(tttttt|)*2,(ttttt|)*2,(tttttt|)*2,tttttL"
+POST_COMBINE_LAYERS = (
+    tuple(range(21, 26)),
+    (*range(4, 10), *range(26, 32)),
+    (*range(10, 16), *range(32, 38)),
+    (*range(16, 21), *range(38, 43)),
+)
+PP1_REPLAY_BASELINE = "20261127T115947Z-c60cbe80"
+KDA_MODULE = "fla.ops.kda.chunk_bwd"
+KDA_IMAGE_ROOT = Path("/opt/venv/lib/python3.12/site-packages")
+KDA_BASELINE_SHA = "069395c9232647f5a4b82fa2dfe7ca077423016d4b641f2696f9d6328dc2e9be"
+KDA_RELEASE = {
+    "commit": "6c70d55a71e7fb4fca7de990015f6a3046193762",
+    "manifest_sha256": "6c383647a70e2c6f0b0fc13f14cd5e0ef6e95ca6d3b34d3e7ecdfdf7e1ba6c1b",
+    "path": "fla/ops/kda/chunk_bwd.py",
+    "sha256": "79d34bd5711a71e455a6b0346085c9431f5b224a5766ed839468a8902ead0e21",
+}
+KDA_FROZEN_FILE = Path("/apertus/auxiliary.py")
 DRAIN_FIRST_CALL = 259
 DRAIN_LAST_CALL = 267
 NOTIFY_TRACE = "APERTUS_CHONK_NOTIFY_TRACE"
@@ -2016,6 +2055,949 @@ class BackwardDrainTrace:
         return run
 
 
+def ownership_trace_requested(environment, layers, chunk, replay, extended_timeout):
+    """Admit the observer only on the full-depth serial-build diagnostic."""
+    setting = environment.get(OWNERSHIP_TRACE, "0")
+    if setting == "0":
+        return False
+    if (setting != "1" or (layers, chunk, replay, extended_timeout) != (42, HEAD_CHUNK, True, True)
+            or compile_threads(environment) != 1):
+        raise ValueError("ownership trace requires the full-depth serial-build recipe")
+    return True
+
+
+class DrainOwnership:
+    """Observe existing host transitions; every retained record contains only scalars."""
+
+    FIELDS = ("allocated_bytes.all.current", "active_bytes.all.current",
+              "reserved_bytes.all.current", "inactive_split_bytes.all.current",
+              "num_alloc_retries", "num_ooms")
+    FP8_FIELDS = ("_rowwise_data", "_rowwise_scale_inv", "_columnwise_data", "_columnwise_scale_inv")
+    MAX_OPERANDS = 512
+    MAX_EXAMPLES = 4
+    MAX_EVENTS = 128
+    DETAIL_RANKS = tuple(sorted({10, *range(0, WORLD, 4)}))
+
+    def __init__(self, torch, emit, drain, rank):
+        self.torch, self.emit, self.drain = torch, emit, drain
+        self.detail = rank in self.DETAIL_RANKS
+        self.layer = None
+        self.counts = {}
+
+    def summarize(self, values):
+        storages, roles, examples = {}, {}, {}
+        truncated = False
+        for i, (role, tensor) in enumerate(values):
+            if i >= self.MAX_OPERANDS:
+                truncated = True
+                break
+            if not isinstance(tensor, self.torch.Tensor):
+                continue
+            storage = tensor.untyped_storage()
+            key = (str(tensor.device), int(storage._cdata), storage.data_ptr())
+            size = storage.nbytes()
+            storages[key] = size
+            owned = roles.setdefault(role, {})
+            if key not in owned:
+                owned[key] = size
+                sample = examples.setdefault(role, [])
+                if len(sample) < self.MAX_EXAMPLES:
+                    sample.append(dict(device=key[0], storage_id=key[1], address=key[2], bytes=size,
+                                       offset=tensor.storage_offset(), dtype=str(tensor.dtype)))
+        return dict(roles={k: dict(storages=len(v), bytes=sum(v.values())) for k, v in roles.items()},
+                    sampled_storage_bytes=sum(storages.values()), examples=examples, truncated=truncated)
+
+    def record(self, boundary, *, context=None, operands=None, **extra):
+        context = self.drain.context() if context is None else context
+        if context is None:
+            return
+        call = context["call"]
+        count = self.counts.get(call, 0)
+        self.counts[call] = count + 1
+        if count >= self.MAX_EVENTS and boundary not in ("call_begin", "call_return"):
+            if count == self.MAX_EVENTS:
+                self.emit("ownership_limit", **context)
+            return
+        detail = {}
+        try:
+            detail["stream"] = str(self.torch.cuda.current_stream().cuda_stream)
+            if operands is None:
+                stats = self.torch.cuda.memory_stats()
+                detail["allocator"] = {key: stats.get(key) for key in self.FIELDS}
+            else:
+                detail["storage"] = self.summarize(operands)
+        except Exception as error:
+            detail["unavailable"] = type(error).__name__
+        self.emit("ownership", **context, **extra, **detail, boundary=boundary,
+                  layer=self.layer, monotonic_ns=monotonic_ns())
+
+    def fp8(self, role, operands):
+        for wrapped in operands:
+            for field in self.FP8_FIELDS:
+                value = getattr(wrapped, field, None)
+                if value is not None:
+                    yield f"{role}{field}", value
+
+    def wrap_layer(self, original):
+        @wraps(original)
+        def run(f_layer, b_layer, *args, **kwargs):
+            if self.drain.context() is None or b_layer is None:
+                return original(f_layer, b_layer, *args, **kwargs)
+            previous = self.layer
+            self.layer = b_layer.layer.layer_number
+            try:
+                return original(f_layer, b_layer, *args, **kwargs)
+            finally:
+                self.layer = previous
+        return run
+
+    def wrap_release(self, original):
+        @wraps(original)
+        def release(plan):
+            self.record("layer_release_begin", layer_released=plan.layer.layer_number)
+            result = original(plan)
+            self.record("layer_release_return")
+            return result
+        return release
+
+    def wrap_backward(self, original):
+        @wraps(original)
+        def run(experts, ctx, dy):
+            if self.drain.context() is None:
+                return original(experts, ctx, dy)
+            def saved():
+                yield "output_gradient", dy
+                rows, retained = ctx.saved_rows or ((), ())
+                yield from self.fp8("saved_fc1_rows", rows)
+                yield from self.fp8("saved_fc1_preactivation", retained or ())
+                for pair in experts._weights.values():
+                    yield from self.fp8("versioned_weights", pair)
+            # Do not unpack saved_tensors a second time: it may run user hooks.
+            self.record("expert_backward_begin", operands=saved(), adapter=id(experts),
+                        pending=len(experts._pending), outstanding=experts._outstanding,
+                        weight_version=[version for _, version, _ in (ctx.version or ())])
+            result = original(experts, ctx, dy)
+            self.record("expert_backward_return", operands=iter(zip(("input_gradient", "router_gradient"), result)),
+                        adapter=id(experts), pending=len(experts._pending),
+                        handoff=id(experts._pending[-1]) if experts._pending else None,
+                        saved_rows_cleared=ctx.saved_rows is None)
+            return result
+        return run
+
+    def wrap_gemm(self, original):
+        @wraps(original)
+        def run(backend, operation, a, b, out, *args, **kwargs):
+            if self.drain.context() is None or operation not in ("fc1_wgrad", "fc2_wgrad"):
+                return original(backend, operation, a, b, out, *args, **kwargs)
+            def operands():
+                yield from self.fp8("column_a", a)
+                yield from self.fp8("column_b", b)
+                for value in out:
+                    yield "fp32_main_grad", value
+            self.record(f"{operation}_begin", operands=operands())
+            result = original(backend, operation, a, b, out, *args, **kwargs)
+            self.record(f"{operation}_return")
+            return result
+        return run
+
+    def wrap_drain(self, original):
+        @wraps(original)
+        def run(experts, *args, **kwargs):
+            if self.drain.context() is None:
+                return original(experts, *args, **kwargs)
+            def queued():
+                if experts._pending:
+                    record = experts._pending[0]
+                    for op, operands in (("fc2", record.fc2), ("fc1", record.fc1)):
+                        for side, values in zip(("a", "b"), operands):
+                            yield from self.fp8(f"{op}_{side}", values)
+            self.record("wgrad_drain_begin", operands=queued(), adapter=id(experts),
+                        pending=len(experts._pending),
+                        handoff=id(experts._pending[0]) if experts._pending else None)
+            result = original(experts, *args, **kwargs)
+            self.record("wgrad_drain_return", adapter=id(experts), pending=len(experts._pending))
+            return result
+        return run
+
+    def wrap_exchange(self, original, operation):
+        @wraps(original)
+        def run(buffer, x, *args, **kwargs):
+            if self.drain.context() is None:
+                return original(buffer, x, *args, **kwargs)
+            def inputs():
+                yield "bf16_input", x
+                yield "router_gradient_input", kwargs.get("topk_weights")
+                handle = kwargs.get("handle", args[0] if args else None)
+                if isinstance(handle, (tuple, list)):
+                    for i, value in enumerate(handle):
+                        yield f"handle_{i}", value
+            self.record(f"reverse_{operation}_begin", operands=inputs())
+            result = original(buffer, x, *args, **kwargs)
+            values = [("bf16_output", result[0])]
+            if operation == "combine":
+                values.append(("router_gradient_output", result[1]))
+            self.record(f"reverse_{operation}_return", operands=iter(values))
+            return result
+        return run
+
+    def wrap_p2p(self, original):
+        @wraps(original)
+        def post(**kwargs):
+            if self.drain.context() is None:
+                return original(**kwargs)
+            keys = ("tensor_send_prev", "tensor_recv_prev", "tensor_send_next", "tensor_recv_next")
+            self.record("p2p_post_begin", operands=((k, kwargs.get(k)) for k in keys),
+                        prev=kwargs.get("prev_pipeline_rank"), next=kwargs.get("next_pipeline_rank"))
+            result = original(**kwargs)
+            self.record("p2p_post_return", requests=len(result))
+            return result
+        return post
+
+
+def pp1_allocator_requested(environment, ownership, kda_release):
+    """Admit the allocator observer only atop the signed full-depth ownership recipe."""
+    setting = environment.get(PP1_ALLOCATOR_TRACE, "0")
+    if setting == "0":
+        return False
+    if setting != "1" or not (ownership and kda_release):
+        raise ValueError("PP1 allocator trace requires the signed KDA ownership recipe")
+    return True
+
+
+def pp1_lifetime_requested(environment, allocator):
+    """Require the stage-1 allocator probe for the narrower lifetime trace."""
+    setting = environment.get(PP1_LIFETIME_TRACE, "0")
+    if setting == "0":
+        return False
+    if setting != "1" or not allocator:
+        raise ValueError("PP1 lifetime trace requires the stage-1 allocator probe")
+    return True
+
+
+def pp1_completion_requested(environment, lifetime):
+    """Enable GPU markers only with the matched allocator history."""
+    setting = environment.get(PP1_COMPLETION_TRACE, "0")
+    if setting == "0":
+        return False
+    if setting != "1" or not lifetime:
+        raise ValueError("PP1 completion trace requires the PP1 lifetime trace")
+    return True
+
+
+PP1_EP_LABEL = "apertus_pp1_ep:"
+PP1_COMPLETION_LABEL = "apertus_pp1_completion:"
+
+
+def pp1_ep_metadata(call, operation, role, *, storage_bytes=None, host_stream=None, comm_stream=None):
+    """Encode scalar-only, generation-local evidence in an allocator event."""
+    return PP1_EP_LABEL + json.dumps(dict(call=call, operation=operation, role=role,
+                                          storage_bytes=storage_bytes, host_stream=host_stream,
+                                          comm_stream=comm_stream), separators=(",", ":"))
+
+
+def pp1_ep_labels(events):
+    """Track EP labels only across an uninterrupted address lifetime in the ring suffix."""
+    live, pending = {}, {}
+    completed = Counter()
+    for event in events:
+        action = event["action"]
+        if action not in ("alloc", "annotate", "free_requested", "free_completed"):
+            continue
+        address = event["addr"]
+        if action == "free_completed":
+            live.pop(address, None)
+            request, labels = pending.pop(address, ({}, {}))
+            size = event["size"]
+            if labs := {k: v for k, v in labels.items()
+                        if k == "scope" or v["storage_bytes"] in (size, request["size"])}:
+                label_kind = next(k for k in ("output", "scope", "input") if k in labs)
+                label = labs[label_kind]
+                completed[label_kind, label["operation"], label["role"]] += size
+        elif action == "free_requested":
+            pending[address] = (event, live.pop(address, {}))
+        else:
+            if action == "alloc":
+                live.pop(address, None)
+                pending.pop(address, None)
+            if address in pending:
+                continue  # An annotation after the free request is not a live observation.
+            metadata = event.get("user_metadata", "")
+            if not isinstance(metadata, str) or not metadata.startswith(PP1_EP_LABEL):
+                continue
+            label = json.loads(metadata[len(PP1_EP_LABEL):])
+            labels = live.setdefault(address, {})
+            if action == "alloc":
+                labels["scope"] = label
+            else:
+                # Keep input and output evidence separately; prefer the last observation of each.
+                labels["output" if label["role"].startswith("out.") else "input"] = label
+    return pending, completed
+
+
+def bounded_frames(frames):
+    """Keep raw frames for a bounded number of examples without copying full stacks."""
+    return [[str(f.get("filename", ""))[-200:], f.get("line"), str(f.get("name", ""))[:100]]
+             for f in frames[:12]]
+
+
+def pp1_completion_lifetimes(snapshot, device, addresses):
+    """Join labeled uses and frees only when their allocation starts in the retained suffix."""
+    live, ended = {}, []
+    for event in snapshot["device_traces"][device]:
+        addr = event.get("addr")
+        if addr not in addresses:
+            continue
+        action = event["action"]
+        if action == "alloc":
+            live[addr] = dict(address=addr, alloc_stream=event["stream"], alloc_size=event["size"],
+                              alloc_time_us=event.get("time_us"), frames=bounded_frames(event.get("frames", ())),
+                              uses=[], ep_scope_or_tag=str(event.get("user_metadata", "")).startswith(PP1_EP_LABEL))
+        elif (item := live.get(addr)) is not None:
+            if action == "annotate" and "free_requested" not in item:
+                metadata = event.get("user_metadata", "")
+                if isinstance(metadata, str) and metadata.startswith(PP1_COMPLETION_LABEL):
+                    label = json.loads(metadata[len(PP1_COMPLETION_LABEL):])
+                    if label["storage_bytes"] == event["size"] == item["alloc_size"]:
+                        item["uses"].append(label)
+                elif isinstance(metadata, str) and metadata.startswith(PP1_EP_LABEL):
+                    item["ep_scope_or_tag"] = True
+            elif action == "free_requested" and event["size"] == item["alloc_size"]:
+                item["free_requested"] = event.get("time_us")
+            elif action == "free_completed":
+                if "free_requested" in item and event["size"] == item["alloc_size"] and item["uses"]:
+                    item.update(state="free_completed", free_completed=event.get("time_us"))
+                    ended.append(item)
+                del live[addr]
+    for seg in snapshot["segments"]:
+        if seg["device"] != device:
+            continue
+        for block in seg["blocks"]:
+            item = live.get(block["address"])
+            if not item or not item["uses"] or block["requested_size"] != item["alloc_size"]:
+                continue
+            state = block["state"]
+            if state == "active_allocated" and "free_requested" not in item:
+                item["state"] = "live"
+            elif state in ("active_pending_free", "active_awaiting_free") and "free_requested" in item:
+                item["state"] = "awaiting_free"
+            else:
+                continue
+            item["block_bytes"] = block["size"]
+            ended.append(item)
+    # A candidate downstream alias or KDA input alone isn't a matched cohort.
+    matched = []
+    for item in ended:
+        roles = {use["role"] for use in item["uses"]}
+        cohorts = sorted(roles & {"combine.input", "combine.output", "dispatch.output"})
+        if ("combine.input" in roles and any(
+                path.endswith("/transformer_engine/pytorch/triton/permutation.py")
+                and name == "unpermute_with_mask_map" for path, _, name in item["frames"])
+                and any(name == "moe_permute_mask_map_backward" for _, _, name in item["frames"])):
+            cohorts.append("te_backward_unpermute")
+        if "kda.input" in roles and not item["ep_scope_or_tag"] and roles == {"kda.input"}:
+            cohorts.append("kda.input")
+        if cohorts:
+            item["cohorts"] = cohorts
+            matched.append(item)
+    return matched
+
+
+class PP1CompletionTrace:
+    """Bounded, nonblocking stream markers joined to the unmodified allocator history."""
+
+    FIRST, LAST = 257, 263
+    PER_CALL = 6
+    NODES = ("mlp", "moe_pre_dispatch", "attn")
+
+    def __init__(self, cuda, emit, progress, enabled):
+        self.cuda, self.emit, self.progress, self.enabled = cuda, emit, progress, enabled
+        self.counts = Counter()
+        self.serial = 0
+        self.addresses, self.outputs = set(), set()
+        self.waits, self.markers = {}, {}
+        self.failed = False
+
+    def current(self):
+        ctx = self.progress()
+        if (not self.failed and self.enabled() and ctx and ctx["backward"] is not None and ctx["forward"] is None
+                and self.FIRST <= ctx["call"] <= self.LAST):
+            return ctx["call"]
+        return None
+
+    def ticket(self, call, kind):
+        key = call, kind
+        self.counts[key] += 1
+        if self.counts[key] > self.PER_CALL:
+            if self.counts[key] == self.PER_CALL + 1:
+                self.emit("pp1_completion_cap", call=call, kind=kind)
+            return None
+        self.serial += 1
+        return self.serial
+
+    def error(self, call, boundary, error):
+        self.failed = True
+        self.emit("pp1_completion_error", call=call, boundary=boundary, error=str(error)[:512])
+
+    def annotate(self, value, call, ticket, role, *, only_output_alias=False):
+        if not getattr(value, "is_cuda", False):
+            return False
+        storage = value.untyped_storage()
+        addr, size = storage.data_ptr(), storage.nbytes()
+        if not addr or not size or (only_output_alias and addr not in self.outputs):
+            return False
+        label = dict(call=call, ticket=ticket, role=role, storage_bytes=size)
+        self.cuda.memory._annotate_tensor(value, PP1_COMPLETION_LABEL + json.dumps(label, separators=(",", ":")))
+        self.addresses.add(addr)
+        if role.endswith(".output"):
+            self.outputs.add(addr)
+        return True
+
+    def mark(self, call, ticket, kind, stream):
+        event = self.cuda.Event(enable_timing=False)
+        event.record(stream)
+        self.markers[ticket, kind] = (event, False)
+        self.emit("pp1_completion_mark", call=call, ticket=ticket, kind=kind,
+                  stream=int(stream.cuda_stream), monotonic_ns=monotonic_ns())
+
+    def wrap_exchange(self, original, operation):
+        @wraps(original)
+        def exchange(buffer, x, *args, **kwargs):
+            call = self.current()
+            h = kwargs.get("handle", args[0] if args else None)
+            pos = 11 if operation == "dispatch" else 5  # index after x in the pinned internode signatures
+            async_finish = kwargs.get("async_finish", args[pos] if len(args) > pos else False)
+            if call is None or not async_finish or h is None or isinstance(x, (tuple, list)):
+                return original(buffer, x, *args, **kwargs)
+            ticket = self.ticket(call, operation)
+            if ticket is not None:
+                try:
+                    if operation == "combine":
+                        self.annotate(x, call, ticket, "combine.input")
+                    self.emit("pp1_completion_exchange_enter", call=call, ticket=ticket, kind=operation)
+                except Exception as exc:
+                    self.error(call, "exchange_enter", exc)
+            result = original(buffer, x, *args, **kwargs)
+            x = h = args = kwargs = None
+            if ticket is not None and not self.failed:
+                try:
+                    self.emit("pp1_completion_exchange_return", call=call, ticket=ticket, kind=operation)
+                    if not self.annotate(result[0], call, ticket, f"{operation}.output"):
+                        return result
+                    overlap = result[-1]
+                    if overlap.event is None:
+                        raise ValueError("async internode exchange returned no native event")
+                    stream = buffer.get_comm_stream()
+                    if int(stream.cuda_stream) != int(buffer.runtime.get_comm_stream()):
+                        raise ValueError("Python and native DeepEP communication streams differ")
+                    self.waits[id(overlap)] = (ref(overlap), call, ticket)
+                    self.mark(call, ticket, "producer_after_native_record", stream)
+                except Exception as exc:
+                    self.error(call, "exchange_return", exc)
+            return result
+        return exchange
+
+    def wrap_wait(self, original):
+        @wraps(original)
+        def wait(overlap, *args, **kwargs):
+            target = self.waits.pop(id(overlap), None)
+            if self.failed or target is None or target[0]() is not overlap:
+                return original(overlap, *args, **kwargs)
+            _, call, ticket = target
+            self.emit("pp1_completion_wait_enter", call=call, ticket=ticket)
+            result = original(overlap, *args, **kwargs)
+            try:
+                self.emit("pp1_completion_wait_enqueued", call=call, ticket=ticket)
+                self.mark(call, ticket, "caller_after_existing_wait", self.cuda.current_stream())
+            except Exception as exc:
+                self.error(call, "wait_return", exc)
+            return result
+        return wait
+
+    def wrap_consumer(self, original, kind):
+        @wraps(original)
+        def consume(*args, **kwargs):
+            call = self.current()
+            owner = args[0] if kind != "kda" else None
+            name = "kda" if kind == "kda" else getattr(owner, "name", None)
+            if (call is None or (kind == "node" and name not in self.NODES)
+                    or (kind == "wgrad" and name != "mlp")):
+                return original(*args, **kwargs)
+            boundary = f"{name}.{kind}"
+            ticket, tagged = None, False
+            try:
+                if kind == "node":
+                    value = args[1:]
+                elif kind == "wgrad":
+                    value = getattr(owner, "output_grads", None)
+                else:
+                    value = (args[8] if len(args) > 8 else kwargs.get("do"),)
+                ticket = self.ticket(call, boundary)
+                if ticket is not None:
+                    for grad in value or ():
+                        tagged |= self.annotate(grad, call, ticket,
+                                                "kda.input" if kind == "kda" else boundary,
+                                                only_output_alias=kind != "kda")
+                    if kind == "kda":
+                        self.emit("pp1_completion_kda_input", call=call, ticket=ticket, tagged=tagged)
+            except Exception as exc:
+                self.error(call, boundary, exc)
+            finally:
+                # Do not hold delayed-wgrad gradients across the original release.
+                value = grad = None
+            result = original(*args, **kwargs)
+            args = kwargs = None
+            if tagged and not self.failed:
+                try:
+                    stream = self.cuda.current_stream() if kind == "kda" else owner.stream
+                    self.mark(call, ticket, boundary, stream)
+                except Exception as exc:
+                    self.error(call, boundary, exc)
+            return result
+        return consume
+
+    def sample(self, call, phase):
+        """Query only at existing schedule boundaries; record one receipt per state change."""
+        if self.failed or not self.FIRST <= call <= self.LAST:
+            return
+        for key, (overlap_ref, producer_call, ticket) in tuple(self.waits.items()):
+            if overlap_ref() is None:
+                del self.waits[key]
+                self.emit("pp1_completion_wait_unseen", call=producer_call, ticket=ticket)
+        for (ticket, kind), (event, seen_not_ready) in tuple(self.markers.items()):
+            try:
+                complete = event.query()
+            except Exception as exc:
+                self.error(call, "query", exc)
+                return
+            if complete or not seen_not_ready:
+                self.emit("pp1_completion_query", call=call, phase=phase, ticket=ticket, kind=kind,
+                          state="complete" if complete else "not_ready", monotonic_ns=monotonic_ns())
+            if complete:
+                del self.markers[ticket, kind]
+            else:
+                self.markers[ticket, kind] = (event, True)
+
+    def close(self):
+        if self.markers or self.waits:
+            self.emit("pp1_completion_unresolved", markers=[list(key) for key in self.markers],
+                      waits=[value[2] for value in self.waits.values()])
+        self.markers.clear()
+        self.waits.clear()
+
+
+def allocator_origin(frames):
+    """Classify the innermost recognizable allocation site, not its current owner."""
+    for frame in frames:
+        filename = frame.get("filename", "")
+        name = frame.get("name", "")
+        if "/megatron/core/transformer/moe/resident_fp8.py" in filename:
+            kind = "resident_weight_cache" if name == "_get_weights" else "resident_experts"
+        elif ("/moe/shared_experts.py" in filename or "/moe/moe_layer.py" in filename
+              and name == "shared_experts_compute"):
+            kind = "shared_experts"
+        elif (any(path in filename for path in ("/moe/token_dispatcher.py", "/moe/fused_a2a.py",
+                                               "/moe/router.py", "/deep_ep/"))
+              or filename.endswith("/fine_grained_callables.py") and name in (
+                  "pre_dispatch_fwd", "post_dispatch_fwd", "submodule_dispatch_forward",
+                  "submodule_combine_forward", "submodule_post_combine_forward")):
+            kind = "routing_dispatch_combine"
+        elif (any(path in filename for path in ("/moe/experts.py", "/moe/moe_utils.py"))
+              or filename.endswith("/fine_grained_callables.py") and name == "submodule_moe_forward"):
+            kind = "routed_mlp_other"
+        elif any(path in filename for path in ("/kimi_delta_attention.py", "/gated_delta_net.py",
+                                               "/fla/ops/kda/", "/fla/modules/convolution/")):
+            kind = "kda"
+        elif any(path in filename for path in ("/transformer/attention.py", "/dot_product_attention/",
+                                               "/fusions/fused_rope", "/rotary_pos_embedding.py",
+                                               "/rope_utils.py")):
+            kind = "other_attention"
+        elif (filename.endswith("/transformer_layer.py") and name == "_forward_attention"):
+            kind = "attention_boundary_other"
+        elif (any(path in filename for path in ("/pipeline_parallel/p2p_communication.py",
+                                                "/pipeline_parallel/combined_1f1b.py",
+                                                "/pipeline_parallel/schedules.py"))
+              and name not in ("combined_1f1b_schedule_for_interleaved_pipelining",
+                               "forward_backward_pipelining_with_interleaving")):
+            kind = "pipeline_schedule"
+        else:
+            continue
+        site = f"{filename.rsplit('/', 1)[-1]}:{frame.get('line', '?')}:{name}"
+        return kind, site[:160]
+    return "unattributed", "unmatched Python stack" if frames else "no Python stack"
+
+
+def resident_weight_storages(chunks):
+    """Read scalar metadata from the live resident cache; never keep a tensor reference."""
+    found = {}
+    for chunk in chunks:
+        for module in chunk.modules():
+            adapter = getattr(module, "_resident_fp8", None)
+            if adapter is None:
+                continue
+            for weights in adapter._weights.values():
+                for weight in weights:
+                    for field in DrainOwnership.FP8_FIELDS:
+                        tensor = getattr(weight, field, None)
+                        if tensor is not None:
+                            storage = tensor.untyped_storage()
+                            if storage.nbytes():
+                                found[storage.data_ptr()] = storage.nbytes()
+    return found
+
+
+def summarize_allocator(snapshot, device, history_limit, resident=None, *, lifetime=False):
+    """Count every Torch block; keep bounded allocation sites and free-request examples."""
+    states = ("active_allocated", "active_awaiting_free", "inactive")
+    raw_states = Counter()
+    traces = snapshot["device_traces"]
+    if not 0 <= device < len(traces) or len(traces[device]) > history_limit:
+        raise ValueError("unexpected allocator trace device or capacity")
+    events = traces[device]
+    ep, completed = pp1_ep_labels(events) if lifetime else ({}, Counter())
+    ep_bytes = Counter()
+    state_bytes = dict.fromkeys(states, 0)
+    requested = dict.fromkeys(states[:2], 0)
+    origins = {state: Counter() for state in states[:2]}
+    sites = {state: Counter() for state in states[:2]}
+    streams = {state: Counter() for state in states}
+    latest = {}
+    actions = Counter()
+    for event in events:
+        action = event["action"]
+        actions[action] += 1
+        if action in ("alloc", "free_requested", "free_completed"):
+            latest[event["addr"]] = event
+    pending_examples = []
+    resident = resident or {}
+    resident_matched = resident_blocks = 0
+    matched = segments_bytes = segments = 0
+    for segment in snapshot["segments"]:
+        if segment["device"] != device:
+            continue
+        segments += 1
+        segments_bytes += segment["total_size"]
+        stream = segment["stream"]
+        for block in segment["blocks"]:
+            raw_state, size = block["state"], block["size"]
+            # Image 910's libtorch_python emits this name for the documented pending state.
+            state = "active_awaiting_free" if raw_state == "active_pending_free" else raw_state
+            if state not in state_bytes:
+                raise ValueError(f"unknown allocator block state: {raw_state!r}")
+            raw_states[raw_state] += size
+            state_bytes[state] += size
+            streams[state][stream] += size
+            if state == "inactive":
+                continue
+            requested[state] += block["requested_size"]
+            frames = block.get("frames", ())
+            kind, site = allocator_origin(frames)
+            address = block["address"]
+            if state == "active_allocated" and address in resident and resident[address] <= size:
+                resident_matched += resident[address]
+                resident_blocks += size
+                kind = "resident_weight_cache"
+            origins[state][kind] += size
+            sites[state][kind, site] += size
+            if state == "active_awaiting_free":
+                event = latest.get(address, {})
+                matches = (event.get("action") == "free_requested"
+                           and event.get("size") in (size, block["requested_size"]))
+                if matches:
+                    matched += size
+                labels = {}
+                if matches and address in ep and ep[address][0] is event:
+                    labels = {k: v for k, v in ep[address][1].items()
+                              if k == "scope" or v["storage_bytes"] in (size, block["requested_size"])}
+                if labels:
+                    # One bucket per block; an input label is evidence of use, not where it was allocated.
+                    label_kind = next(k for k in ("output", "scope", "input") if k in labels)
+                    label = labels[label_kind]
+                    ep_bytes[kind, label_kind, label["operation"], label["role"]] += size
+                key = (size, address)
+                limit = 48 if lifetime else 12
+                if len(pending_examples) == limit and key <= pending_examples[0][0]:
+                    continue
+                example = dict(address=address, block_bytes=size, allocation_stream=stream,
+                               allocation_origin=kind, allocation_site=site)
+                if matches:
+                    example.update(free_request_stream=event["stream"],
+                                   free_request_site=allocator_origin(event.get("frames", ()))[1])
+                if lifetime:
+                    example.update(allocation_frames=bounded_frames(frames), ep_labels=labels)
+                    if matches:
+                        example["free_request_frames"] = bounded_frames(event.get("frames", ()))
+                if len(pending_examples) < limit:
+                    heappush(pending_examples, (key, example))
+                else:
+                    heapreplace(pending_examples, (key, example))
+    if not segments or sum(state_bytes.values()) != segments_bytes:
+        raise ValueError("allocator block bytes do not reconcile to mapped segments")
+    return dict(segments=segments, segment_bytes=segments_bytes, block_bytes_by_state=state_bytes,
+                block_bytes_by_raw_state=raw_states,
+                requested_bytes_by_state=requested, origin_bytes_by_state=origins,
+                top_sites_by_state={s: [[*key, size] for key, size in c.most_common(20)]
+                                    for s, c in sites.items()},
+                top_segment_streams_by_state={s: c.most_common(12) for s, c in streams.items()},
+                pending_examples=[example for _, example in sorted(pending_examples, reverse=True)],
+                pending_bytes_with_matching_free_request=matched,
+                resident_storage_bytes=sum(resident.values()), resident_storage_bytes_matched=resident_matched,
+                resident_matched_block_bytes=resident_blocks,
+                history_entries=len(events), history_at_capacity=len(events) == history_limit,
+                history_actions=actions,
+                pending_ep_label_bytes=[[*key, value] for key, value in ep_bytes.most_common()],
+                recent_ep_free_completed_bytes=[[*key, value] for key, value in completed.most_common()])
+
+
+class PP1AllocatorTrace:
+    """Sample Torch's CPU allocator metadata only, on two PP1 ranks."""
+
+    RANKS = (16, 28)
+    LIMIT = 4096
+    LIFETIME_LIMIT = 32768
+    EP_START = 248
+    WINDOWS = {1: "fill", 257: "drain"}
+    END = {9, 263}
+    FILL = {(n, phase) for n in (1, 2, 5, 6) for phase in ("enter", "return")} | {(9, "return")}
+    DRAIN = {(257, "enter"), (259, "enter"), (259, "return"), (260, "return"),
+             (263, "enter"), (263, "return")}
+
+    def __init__(self, cuda, emit, lifetime=False, completion=None):
+        self.cuda, self.emit = cuda, emit
+        self.memory = cuda.memory
+        self.lifetime = lifetime
+        self.completion = completion
+        self.window = None
+        self.failed = False
+        self.ep_failed = False
+        self.ep_counts = Counter()
+
+    def wrap_ep(self, original, operation, progress):
+        """Tag visible buffers and allocations within the pinned internode wrappers."""
+        def annotate(value, role, call, host_stream, comm_stream):
+            if isinstance(value, (list, tuple)):
+                for i, item in enumerate(value):
+                    annotate(item, f"{role}.{i}", call, host_stream, comm_stream)
+            elif getattr(value, "is_cuda", False):
+                storage = value.untyped_storage()
+                size = storage.nbytes()
+                if size and storage.data_ptr():
+                    self.memory._annotate_tensor(value, pp1_ep_metadata(
+                        call, operation, role, storage_bytes=size, host_stream=host_stream,
+                        comm_stream=comm_stream))
+
+        @wraps(original)
+        def wrapped(buffer, x, *args, **kwargs):
+            ctx = progress()
+            if (self.failed or self.ep_failed or self.window != "actions" or ctx is None
+                    or not self.EP_START <= ctx["call"] <= 263):
+                return original(buffer, x, *args, **kwargs)
+            call = ctx["call"]
+            previous = None
+            try:
+                host_stream = int(self.cuda.current_stream().cuda_stream)
+                comm_stream = int(buffer.get_comm_stream().cuda_stream)
+                previous = self.memory._get_memory_metadata()
+                annotate(x, "in.tokens", call, host_stream, comm_stream)
+                annotate(kwargs.get("handle", args[0] if args else None), "in.handle",
+                         call, host_stream, comm_stream)
+                self.memory._set_memory_metadata(pp1_ep_metadata(
+                    call, operation, "scope", host_stream=host_stream, comm_stream=comm_stream))
+            except Exception as error:
+                self.ep_failed = True
+                self.emit("pp1_lifetime_error", call=call, operation=operation, error=str(error)[:512])
+            try:
+                result = original(buffer, x, *args, **kwargs)
+            finally:
+                if previous is not None:
+                    try:
+                        self.memory._set_memory_metadata(previous)
+                    except Exception as error:
+                        self.ep_failed = True
+                        self.emit("pp1_lifetime_error", call=call, operation=operation, error=str(error)[:512])
+            if not self.ep_failed:
+                try:
+                    fields = ("tokens", "topk_idx", "topk_weights") if operation == "dispatch" else (
+                        "tokens", "topk_weights")
+                    for i, name in enumerate(fields):
+                        annotate(result[i], f"out.{name}", call, host_stream, comm_stream)
+                    if operation == "dispatch":
+                        annotate(result[4], "out.handle", call, host_stream, comm_stream)
+                    self.ep_counts[operation] += 1
+                except Exception as error:
+                    self.ep_failed = True
+                    self.emit("pp1_lifetime_error", call=call, operation=operation, error=str(error)[:512])
+            return result
+
+        return wrapped
+
+    def close(self):
+        """Stop history in both the normal and exception paths."""
+        if self.window is not None:
+            self.window = None
+            try:
+                self.memory._record_memory_history(enabled=None)
+            except Exception as error:
+                self.failed = True
+                self.emit("pp1_allocator_error", boundary="disable", error=str(error)[:512])
+
+    def observe(self, phase, progress, get_chunk, get_resident):
+        """Write summaries before the next training call can fail."""
+        call = progress["call"]
+        key = (call, phase)
+        if self.completion is not None:
+            self.completion.sample(call, phase)
+        start_actions = self.lifetime and key == (self.EP_START, "enter")
+        if self.failed or not (start_actions or key in self.FILL | self.DRAIN):
+            return
+        start = monotonic_ns()
+        try:
+            limit = self.LIFETIME_LIMIT if self.lifetime else self.LIMIT
+            if start_actions:
+                self.window = "actions"
+                self.memory._record_memory_history(enabled="all", context="all", stacks="python",
+                                                   max_entries=limit, clear_history=True)
+                self.emit("pp1_lifetime_actions_begin", call=call, history_limit=limit)
+                return
+            if phase == "enter" and call in self.WINDOWS and (not self.lifetime or call == 1):
+                self.window = self.WINDOWS[call]
+                self.memory._record_memory_history(
+                    enabled="state" if self.window == "fill" else "all",
+                    context="state" if self.window == "fill" else "all",
+                    stacks="python", max_entries=limit, clear_history=True)
+            forward = key in self.FILL
+            if self.window != ("fill" if forward else "actions" if self.lifetime else "drain"):
+                raise ValueError("unexpected allocator history window")
+            virtual_id = progress["forward" if forward else "backward"]
+            opposite = progress["backward" if forward else "forward"]
+            if type(virtual_id) is not int or opposite is not None:
+                raise ValueError("unexpected PP1 fill/drain schedule")
+            chunk = get_chunk(virtual_id, forward=forward)
+            device = self.cuda.current_device()
+            snapshot = self.memory._snapshot()
+            data = summarize_allocator(snapshot, device, limit, get_resident(),
+                                       lifetime=self.lifetime and not forward)
+            stats = self.cuda.memory_stats()
+            counters = {k: stats[k] for k in DrainOwnership.FIELDS}
+            self.emit("pp1_allocator", call=call, phase=phase, window="fill" if forward else "drain", chunk=chunk,
+                      forward=progress["forward"], backward=progress["backward"], device=device,
+                       snapshot_ns=monotonic_ns() - start, allocator=counters,
+                       ep_calls_annotated=dict(self.ep_counts), **data)
+            if self.completion is not None and not forward:
+                self.emit("pp1_completion_lifetimes", call=call, phase=phase,
+                          history_at_capacity=data["history_at_capacity"],
+                          lifetimes=pp1_completion_lifetimes(snapshot, device, self.completion.addresses))
+        except Exception as error:
+            # The diagnostic must not kill otherwise healthy peers on a private API failure.
+            self.failed = True
+            self.emit("pp1_allocator_error", call=call, phase=phase, error=str(error)[:512])
+            self.close()
+        finally:
+            if phase == "return" and call in self.END and (not self.lifetime or call == 263):
+                self.close()
+                if self.completion is not None:
+                    self.completion.close()
+
+
+def verify_pp1_allocator(rows, rank, lifetime=False):
+    """Require complete and reconciled allocator evidence if the training step succeeds."""
+    samples = [r for r in rows if r["event"] == "pp1_allocator"]
+    errors = [r for r in rows if r["event"] in ("pp1_allocator_error", "pp1_lifetime_error")]
+    action_starts = [r["call"] for r in rows if r["event"] == "pp1_lifetime_actions_begin"]
+    if rank not in PP1AllocatorTrace.RANKS:
+        if samples or errors or action_starts:
+            raise ValueError(f"unexpected PP1 allocator samples on rank {rank}")
+        return
+    keys = [(r["call"], r["phase"]) for r in samples]
+    expected = PP1AllocatorTrace.FILL | PP1AllocatorTrace.DRAIN
+    if errors or len(keys) != len(expected) or set(keys) != expected:
+        raise ValueError(f"incomplete PP1 allocator evidence on rank {rank}")
+    if action_starts != ([PP1AllocatorTrace.EP_START] if lifetime else []):
+        raise ValueError(f"unexpected PP1 lifetime history window on rank {rank}")
+    if lifetime and not any(all(row["ep_calls_annotated"].get(op, 0) > 0
+                               for op in ("dispatch", "combine")) for row in samples):
+        raise ValueError(f"PP1 lifetime trace lacks annotated EP calls on rank {rank}")
+    for row in samples:
+        a, b, c = (row["block_bytes_by_state"][k]
+                   for k in ("active_allocated", "active_awaiting_free", "inactive"))
+        stats = row["allocator"]
+        if (a != stats["allocated_bytes.all.current"] or a + b != stats["active_bytes.all.current"]
+                or a + b + c != stats["reserved_bytes.all.current"]):
+            raise ValueError(f"PP1 allocator metadata and counters differ on rank {rank}")
+    if not any(r["resident_storage_bytes_matched"] for r in samples if r["window"] == "fill"):
+        raise ValueError(f"PP1 allocator lacks matched resident weight storage on rank {rank}")
+
+
+def verify_pp1_completion(rows, rank):
+    """Validate the receipts without requiring unresolved GPU work to have completed."""
+    trace = [r for r in rows if r["event"].startswith("pp1_completion_")]
+    if rank not in PP1AllocatorTrace.RANKS:
+        if trace:
+            raise ValueError(f"unexpected PP1 completion evidence on rank {rank}")
+        return
+
+    def require(condition):
+        if not condition:
+            raise ValueError(f"missing or inconsistent PP1 completion evidence on rank {rank}")
+
+    snapshots = [(r["call"], r["phase"]) for r in trace if r["event"] == "pp1_completion_lifetimes"]
+    require(len(snapshots) == len(PP1AllocatorTrace.DRAIN) and set(snapshots) == PP1AllocatorTrace.DRAIN)
+    entered, returned, waiting, waited, markers, states, cohorts = {}, {}, set(), set(), set(), {}, set()
+    kda_inputs = set()
+    for row in trace:
+        event, ticket, kind = row["event"], row.get("ticket"), row.get("kind")
+        key = ticket, kind
+        if event == "pp1_completion_error":
+            require(False)
+        elif event == "pp1_completion_exchange_enter":
+            require(ticket not in entered)
+            entered[ticket] = kind
+        elif event == "pp1_completion_exchange_return":
+            require(entered.get(ticket) == kind and ticket not in returned)
+            returned[ticket] = kind
+        elif event == "pp1_completion_wait_enter":
+            require(ticket in returned and ticket not in waiting)
+            waiting.add(ticket)
+        elif event == "pp1_completion_wait_enqueued":
+            require(ticket in waiting and ticket not in waited)
+            waited.add(ticket)
+        elif event == "pp1_completion_kda_input":
+            if row["tagged"]:
+                require(ticket not in kda_inputs)
+                kda_inputs.add(ticket)
+        elif event == "pp1_completion_mark":
+            require(key not in markers)
+            if kind == "producer_after_native_record":
+                require(ticket in returned)
+            if kind == "caller_after_existing_wait":
+                require(ticket in waited)
+            if kind == "kda.kda":
+                require(ticket in kda_inputs)
+            markers.add(key)
+        elif event == "pp1_completion_query":
+            require(key in markers and row["state"] in ("not_ready", "complete")
+                    and states.get(key) not in (row["state"], "complete"))
+            states[key] = row["state"]
+        elif event == "pp1_completion_lifetimes":
+            for generation in row["lifetimes"]:
+                cohorts.update(generation["cohorts"])
+    require(entered == returned and set(returned.values()) == {"dispatch", "combine"}
+            and waited == set(returned))
+    require(kda_inputs and kda_inputs == {ticket for ticket, kind in markers if kind == "kda.kda"} and states)
+    require({"dispatch.output", "combine.output", "te_backward_unpermute", "kda.input"} <= cohorts)
+
+
+def verify_ownership(rows, rank):
+    """Require interval endpoints on success; unavailable detail is explicit, not a fault finding."""
+    calls = {r["call"] for r in rows if r["event"] == "schedule_exit"
+             and DRAIN_FIRST_CALL <= r["call"] <= DRAIN_LAST_CALL
+             and r["forward"] is None and r["backward"] is not None}
+    for boundary in ("call_begin", "call_return"):
+        found = [r for r in rows if r["event"] == "ownership" and r["boundary"] == boundary]
+        if (not calls or len(found) != len(calls) or {r["call"] for r in found} != calls
+                or any("allocator" not in r and "unavailable" not in r for r in found)):
+            raise ValueError(f"rank {rank} missing ownership {boundary} evidence")
+
+
 def verify_backward_drain(rows, rank):
     """A successful update must pass the tail schedule and real optimizer phases."""
     pending, seen, phases = {}, set(), []
@@ -2047,12 +3029,27 @@ def verify_backward_drain(rows, rank):
         raise ValueError(f"rank {rank} missing backward drain or optimizer evidence")
 
 
+def compile_threads(environment):
+    """Read the allowed compiler profile; older frozen checks used four threads."""
+    requested = environment.get("TORCHINDUCTOR_COMPILE_THREADS", str(COMPILE_THREADS))
+    if requested == "1":
+        if any(environment.get(key) != value for key, value in SERIAL_BUILD_ENV.items()):
+            raise ValueError("one-thread Inductor requires the full serial build environment")
+        return 1
+    if requested != str(COMPILE_THREADS):
+        raise ValueError(f"expected {COMPILE_THREADS} Inductor compile threads or serial profile, got {requested!r}")
+    return COMPILE_THREADS
+
+
 def verify_compile_threads(effective):
     """Reject a missing or ignored Inductor limit before the diagnostic runs."""
+    expected = compile_threads(os.environ)
     requested = os.environ.get("TORCHINDUCTOR_COMPILE_THREADS")
-    if requested != str(COMPILE_THREADS) or effective != COMPILE_THREADS:
-        raise ValueError(f"expected {COMPILE_THREADS} Inductor compile threads, "
+    if requested != str(expected) or type(effective) is not int or effective != expected:
+        raise ValueError(f"expected {expected} Inductor compile threads, "
                          f"requested {requested!r}, effective {effective}")
+    return ({"serial_build_environment": {key: os.environ[key] for key in SERIAL_BUILD_ENV}}
+            if expected == 1 else {})
 
 
 def trace_boundary(original, name, observe, active, describe=None, describe_result=None):
@@ -2072,10 +3069,309 @@ def trace_boundary(original, name, observe, active, describe=None, describe_resu
     return wrapped
 
 
+def post_combine_profile(frozen):
+    """Admit only the signed, matched one-update replay diagnostic."""
+    flags = [a for a in frozen["args"] if a.split("=", 1)[0] == POST_COMBINE_FLAG]
+    if not flags:
+        return False
+    env, procedure = frozen["environment"], frozen["procedure"]
+    snapshot = frozen["source_snapshot"]
+    args = frozen["args"]
+    if procedure.get("checkpoint") is True:
+        if tuple(args[-len(SYNC_SAVE_ARGS):]) != SYNC_SAVE_ARGS:
+            raise ValueError("unexpected synchronous replay checkpoint options")
+        args = args[:-len(SYNC_SAVE_ARGS)]
+    disabled = (NOTIFY_TRACE, DEPENDENCY_TRACE, PREFIX_TRACE, P2P_PAIR_TRACE, LATER_P2P_TRACE,
+                LATER_PHASE_TRACE, REVERSE_READY_TRACE, STALL_TRACE, HANDOFF_TRACE, OWNERSHIP_TRACE,
+                REDUCED_DRAIN_TRACE, PP1_ALLOCATOR_TRACE, PP1_LIFETIME_TRACE, PP1_COMPLETION_TRACE)
+    if (
+        flags != [POST_COMBINE_FLAG]
+        or sha256_bytes(json.dumps(args, separators=(",", ":")).encode()).hexdigest()
+        != POST_COMBINE_ARGS
+        or frozen["entrypoint"] != "pretrain_gpt.py"
+        or frozen["source"]["commit"] != POST_COMBINE_SOURCE
+        or (snapshot["tree"], snapshot["sha256"], snapshot["manifest_sha256"])
+        != (POST_COMBINE_TREE, POST_COMBINE_ARCHIVE, POST_COMBINE_MANIFEST)
+        or frozen["image"]["sha256"] != CK_IMAGE
+        or env.get(CK_PREWARM) != CK_NODE_VERIFIED or env.get(UCCL_CPU_TIMEOUT) != "600"
+        or any(env.get(key, "0") != "0" for key in disabled)
+        or procedure["kind"] != "probe" or procedure.get("checkpoint", False) not in (False, True)
+        or procedure["timeout"] != 2700 or procedure["gpu_identity_timeout"] != 600
+        or procedure.get("auxiliary_source") != KDA_RELEASE
+        or not procedure.get("memory_telemetry")
+    ):
+        raise ValueError("unexpected full-layout post-combine replay inputs")
+    return True
+
+
+def observe_sync_save(training, checkpointing, target, emit, saved_updates):
+    """Record native checkpoint boundaries and state keys without examining GPU tensors."""
+    generate, original_save = checkpointing.generate_state_dict, training.save_checkpoint_and_time
+    active = completed = False
+    generated = 0
+
+    @wraps(generate)
+    def state(*args, **kwargs):
+        nonlocal generated
+        result = generate(*args, **kwargs)
+        if active:
+            scheduler_steps = result["opt_param_scheduler"]["num_steps"]
+            if (generated or not SYNC_SAVE_STATE <= result.keys() or result["iteration"] != 1
+                    or result["args"].consumed_train_samples != BATCH or scheduler_steps != BATCH
+                    or any(not result[k] for k in SYNC_SAVE_STATE)):
+                raise ValueError("unexpected full-layout checkpoint state")
+            generated += 1
+            emit("checkpoint_state", iteration=1, consumed_samples=BATCH,
+                 scheduler_steps=scheduler_steps, keys=sorted(result))
+        return result
+
+    @wraps(original_save)
+    def save(iteration, *args, **kwargs):
+        nonlocal active, completed
+        settings = training.get_args()
+        if (active or completed or saved_updates() != 1 or iteration != 1
+                or settings.consumed_train_samples != BATCH or settings.save != str(target)
+                or settings.ckpt_format != "torch_dist" or settings.async_save
+                or settings.no_save_optim or settings.no_save_rng
+                or settings.ckpt_staging != "streamed" or kwargs.get("non_persistent_ckpt")):
+            raise ValueError("unexpected synchronous checkpoint boundary")
+        emit("checkpoint_enter", iteration=iteration, consumed_samples=BATCH)
+        start = monotonic()
+        active = True
+        try:
+            result = original_save(iteration, *args, **kwargs)
+        finally:
+            active = False
+        if generated != 1:
+            raise ValueError("synchronous save missing state generation receipt")
+        completed = True
+        emit("checkpoint_exit", iteration=iteration, consumed_samples=BATCH, seconds=monotonic() - start)
+        return result
+
+    checkpointing.generate_state_dict, training.save_checkpoint_and_time = state, save
+    return lambda: completed
+
+
+def verify_sync_save_trace(rows, rank):
+    """Require one terminal save after the accepted update on every rank."""
+    names = ("update_exit", "checkpoint_enter", "checkpoint_state", "checkpoint_exit", "completed")
+    receipts = [row for row in rows if row["event"] in names]
+    if (tuple(r["event"] for r in receipts) != names
+            or any((r.get("iteration"), r.get("consumed_samples")) != (1, BATCH)
+                   for r in receipts[1:4])
+            or receipts[2].get("scheduler_steps") != BATCH
+            or not SYNC_SAVE_STATE <= set(receipts[2].get("keys", []))
+            or not 0 < receipts[3].get("seconds", 0) < math.inf):
+        raise ValueError(f"rank {rank} missing completed synchronous save evidence")
+    return receipts[3]["seconds"]
+
+
+def checkpoint_inventory(root, *, reader=None):
+    """Inventory the saved step and check each DCP metadata reference is in bounds."""
+    target = root / "iter_0000001"
+    tracker = root / "latest_checkpointed_iteration.txt"
+    if (root.is_symlink() or tracker.is_symlink() or not tracker.is_file()
+            or tracker.read_text().strip() != "1" or target.is_symlink() or not target.is_dir()
+            or {p.name for p in root.glob("iter_*")} != {target.name}):
+        raise ValueError("missing unique iteration-one checkpoint")
+    files = {}
+    for path in sorted(target.iterdir()):
+        if path.is_symlink() or not path.is_file() or not (size := path.stat().st_size):
+            raise ValueError(f"invalid checkpoint member: {path.name}")
+        files[path.name] = size
+    sidecars = (".metadata", "common.pt", "metadata.json")
+    shards = {name for name in files if name.endswith(".distcp")}
+    if not shards or not set(sidecars) <= files.keys():
+        raise ValueError("incomplete torch_dist checkpoint")
+    config = json.loads((target / "metadata.json").read_text())
+    if (config.get("sharded_backend"), config.get("common_backend")) != ("torch_dist", "torch"):
+        raise ValueError("unexpected checkpoint backend")
+    if reader is None:
+        from torch.distributed.checkpoint import FileSystemReader
+
+        reader = FileSystemReader
+    storage = reader(target).read_metadata().storage_data
+    if not storage:
+        raise ValueError("checkpoint has no shard extents")
+    used = set()
+    for item in storage.values():
+        name, offset, length = item.relative_path, item.offset, item.length
+        if name not in shards or not (0 <= offset < offset + length <= files[name]):
+            raise ValueError(f"invalid torch_dist extent: {name}")
+        used.add(name)
+    if used != shards:
+        raise ValueError("checkpoint includes unreferenced shards")
+    return dict(iteration=1, bytes=sum(files.values()), shards=len(shards), files=files,
+                sidecar_sha256={name: sha256(target / name) for name in sidecars},
+                tracker_sha256=sha256(tracker), metadata_extents=len(storage),
+                tensor_integrity="not assessed", restoration="not assessed")
+
+
+class PostCombineLifecycle:
+    """Count the signed local operation and its existing delayed projection drain, by layer."""
+
+    def __init__(self, rank):
+        self.layers = POST_COMBINE_LAYERS[rank // 16]
+        self.live = {key: Counter() for key in ("forward", "replay", "drain")}
+
+    def counts(self):
+        return {key: {str(layer): count for layer, count in sorted(counts.items())}
+                for key, counts in self.live.items()}
+
+    def add(self, phase, moe):
+        layer = moe.layer_number
+        if layer not in self.layers:
+            raise ValueError(f"unexpected post-combine replay layer {layer}")
+        self.live[phase][layer] += 1
+
+    def wrap_forward(self, original):
+        @wraps(original)
+        def forward(moe, output, shared, *, checkpoint=None):
+            result = original(moe, output, shared, checkpoint=checkpoint)
+            if checkpoint is None or checkpoint.ctx is None:
+                raise ValueError("training forward did not arm the post-combine checkpoint")
+            self.add("forward", moe)
+            return result
+
+        return forward
+
+    def wrap_replay(self, original, local_region):
+        @wraps(original)
+        def replay(checkpoint, grad):
+            region = checkpoint.run_function
+            target = getattr(region, "__func__", None) is local_region and checkpoint.ctx is not None
+            result = original(checkpoint, grad)
+            if target:
+                if checkpoint.ctx is not None or checkpoint.outputs is not None:
+                    raise ValueError("local replay did not restore and release checkpoint state")
+                self.add("replay", region.__self__)
+            return result
+
+        return replay
+
+    def wrap_drain(self, original):
+        @wraps(original)
+        def drain(moe, routed_experts=True, shared_experts=False):
+            if not routed_experts:
+                return original(moe, routed_experts=routed_experts, shared_experts=shared_experts)
+            queue = moe.fc2_latent_proj.wgrad_store.context
+            layer = moe.layer_number
+            if queue.qsize() != 1 or self.live["replay"][layer] != self.live["drain"][layer] + 1:
+                raise ValueError(f"projection wgrad not queued exactly once after replay: layer {layer}")
+            result = original(moe, routed_experts=routed_experts, shared_experts=shared_experts)
+            if not queue.empty():
+                raise ValueError(f"projection wgrad not drained: layer {layer}")
+            self.add("drain", moe)
+            return result
+
+        return drain
+
+
+def verify_post_combine_trace(rows, rank):
+    """Require the full per-layer lifecycle and phase-scoped absolute peak receipts."""
+    exits = [r for r in rows if r["event"] == "schedule_exit"]
+    first = next((r for r in exits if r["backward"] is not None), None)
+    peak = [r for r in rows if r["event"] == "post_combine_backward_peak"]
+    final = [r for r in rows if r["event"] == "post_combine_lifecycle"]
+    updates = [r for r in rows if r["event"] == "update_exit"]
+    expected = {str(layer): MICRO for layer in POST_COMBINE_LAYERS[rank // 16]}
+    if (
+        first is None or len(peak) != 1 or len(final) != 1
+        or (peak[0]["first_call"], peak[0]["last_call"]) != (first["call"], exits[-1]["call"])
+        or exits[-1]["backward"] != 255 or exits[-1]["forward"] is not None
+        or [r["backward"] for r in exits if r["backward"] is not None] != list(range(2 * MICRO))
+        or [r["forward"] for r in exits if r["forward"] is not None] != list(range(2 * MICRO))
+        or final[0]["counts"] != dict.fromkeys(("forward", "replay", "drain"), expected)
+        or not 0 < peak[0]["allocated"] <= peak[0]["reserved"]
+        or (peak[0]["allocated"], peak[0]["reserved"])
+        != (exits[-1]["backward_phase_peak_allocated"], exits[-1]["backward_phase_peak_reserved"])
+    ):
+        raise ValueError(f"rank {rank} missing complete post-combine lifecycle or backward peak")
+    if (len(updates) != 1 or updates[0]["calls"] != exits[-1]["call"]
+            or not 0 < updates[0]["grad_norm"] < math.inf
+            or set(updates[0]["losses"]) != ({"lm loss"} if rank in TRACE_RANKS else set())
+            or not all(math.isfinite(v) for v in updates[0]["losses"].values())):
+        raise ValueError(f"rank {rank} missing finite update evidence")
+    if rank in PRESSURE_RANKS:
+        fill = [r for r in exits if r["call"] == PRESSURE_CALL]
+        if len(fill) != 1 or (fill[0]["forward"], fill[0]["backward"]) != (8, None):
+            raise ValueError(f"rank {rank} missing matched PP1 fill-exit boundary")
+        counts = fill[0]["post_combine_counts"]
+        if counts != {"forward": {str(layer): (5 if layer < 26 else 4)
+                                  for layer in POST_COMBINE_LAYERS[1]}, "replay": {}, "drain": {}}:
+            raise ValueError(f"rank {rank} missing 54 post-combine checkpoints at fill exit")
+    return {"allocated": peak[0]["allocated"], "reserved": peak[0]["reserved"],
+            "first_call": peak[0]["first_call"], "last_call": peak[0]["last_call"]}
+
+
+def compare_post_combine_memory(run, baseline):
+    """Compare only observed identical PP1 call boundaries; keep missing rows explicit."""
+    if baseline.name != PP1_REPLAY_BASELINE:
+        raise ValueError("unexpected PP1 replay comparison baseline")
+    candidate = json.loads((run / "resolved.json").read_text())
+    reference = json.loads((baseline / "resolved.json").read_text())
+    if (
+        not post_combine_profile(candidate)
+        or candidate["args"] != reference["args"] + [POST_COMBINE_FLAG]
+        or candidate["resources"] != reference["resources"]
+        or reference["source"]["commit"] != STALL_SOURCE
+        or candidate["image"] != reference["image"]
+    ):
+        raise ValueError("unmatched PP1 replay comparison inputs")
+
+    def samples(directory, rank):
+        path = directory / "output" / f"gpu-progress-rank-{rank}.jsonl"
+        # A killed rank may leave its final line truncated. Only parse complete receipts.
+        text = path.read_text() if path.is_file() else ""
+        rows = text.split("\n")[:-1]
+        selected = {}
+        for line in rows:
+            row = json.loads(line)
+            key = (row["event"], row.get("call"))
+            if key in boundaries and row["rank"] == rank:
+                if key in selected:
+                    raise ValueError(f"duplicate PP1 boundary: rank {rank}, {key}")
+                selected[key] = row
+        return selected
+
+    boundaries = (("schedule_exit", 9), ("schedule_enter", 257), ("schedule_enter", 259),
+                  ("schedule_exit", 259), ("schedule_exit", 260), ("schedule_enter", 263),
+                  ("schedule_exit", 263))
+    fields = ("allocated", "reserved", "peak_allocated", "peak_reserved")
+    per_rank = {}
+    for rank in PRESSURE_RANKS:
+        base, replay = (samples(d, rank) for d in (baseline, run))
+        per_rank[rank] = table = {}
+        for key in boundaries:
+            a, b = base.get(key), replay.get(key)
+            context = ("forward", "backward")
+            if a and b and any(a[k] != b[k] for k in context):
+                raise ValueError(f"unmatched PP1 context: rank {rank}, {key}")
+            table[f"{key[0]}:{key[1]}"] = {
+                "baseline": {k: a[k] for k in (*context, *fields)} if a else None,
+                "replay": {k: b[k] for k in (*context, *fields)} if b else None,
+                "replay_minus_baseline": {k: b[k] - a[k] for k in fields} if a and b else None,
+                "replay_backward_phase_peak": (
+                    {k: b[f"backward_phase_peak_{k}"] for k in ("allocated", "reserved")}
+                    if b and "backward_phase_peak_allocated" in b else None),
+            }
+    node_totals = {}
+    for rank in range(PRESSURE_RANKS.start, PRESSURE_RANKS.stop, 4):
+        deltas = [per_rank[r]["schedule_exit:9"]["replay_minus_baseline"] for r in range(rank, rank + 4)]
+        node_totals[rank // 4] = (
+            {k: sum(row[k] for row in deltas) for k in ("allocated", "reserved")}
+            if all(row is not None for row in deltas) else None)
+    return dict(baseline=baseline.name, candidate=run.name, per_rank=per_rank,
+                fill_exit_node_deltas=node_totals,
+                scope="logical-boundary sums, not simultaneous node samples; baseline peaks are cumulative")
+
+
 def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_trace=False,
-            prefix_trace=False, pair_trace=False, ck_seed=None, later_trace=False, later_phase=False,
-            reverse_ready=False, stall_trace=False, handoff_trace=False, extended_timeout=False,
-            reduced_drain=False):
+             prefix_trace=False, pair_trace=False, ck_seed=None, later_trace=False, later_phase=False,
+             reverse_ready=False, stall_trace=False, handoff_trace=False, extended_timeout=False,
+             reduced_drain=False, ownership_trace=False, pp1_allocator_trace=False,
+             pp1_lifetime_trace=False, pp1_completion_trace=False, *, pp1_kda_evidence=None,
+             post_combine=False, checkpoint=None):
     """Observe native overlap schedule boundaries without adding GPU synchronization."""
     import torch
     from torch._inductor import config as inductor
@@ -2091,14 +3387,17 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
     from megatron.core.transformer.moe import token_dispatcher
     from megatron.training import training
 
-    verify_compile_threads(inductor.compile_threads)
-    emit("compiler_config", inductor_compile_threads=inductor.compile_threads)
+    compiler = verify_compile_threads(inductor.compile_threads)
+    emit("compiler_config", inductor_compile_threads=inductor.compile_threads, **compiler)
     original_step = training.train_step
     original_combined = schedules.combined_1f1b_schedule_for_interleaved_pipelining
     last_hip = float("-inf")
     calls, updates = 0, 0
     rank = int(os.environ["RANK"])
     active_call = None
+    post_lifecycle = PostCombineLifecycle(rank) if post_combine else None
+    backward_first = backward_last = None
+    fill_peaks = backward_peaks = (0, 0)
     replay_seen = False
     dependencies = None
     if dependency_trace and rank in TRACE_RANKS:
@@ -2123,12 +3422,25 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
     stall = (StallTrace(torch.cuda, emit, lambda: active_call, readiness.target)
              if stall_trace and readiness is not None else None)
     handoff = GraphHandoffTrace(torch.cuda, emit, stall) if handoff_trace and rank in PRESSURE_RANKS else None
-    drain = BackwardDrainTrace(emit, lambda: active_call) if reduced_drain else None
+    drain = BackwardDrainTrace(emit, lambda: active_call) if reduced_drain or ownership_trace else None
+    ownership = DrainOwnership(torch, emit, drain, rank) if ownership_trace else None
+    pp1_allocator = completion = None
+    if pp1_allocator_trace and rank in PP1AllocatorTrace.RANKS:
+        pp1_allocator = PP1AllocatorTrace(torch.cuda, emit, pp1_lifetime_trace)
+        if pp1_completion_trace:
+            if pp1_kda_evidence is None:
+                raise ValueError("PP1 comparison requires verified signed KDA")
+            completion = PP1CompletionTrace(
+                torch.cuda, emit, lambda: active_call,
+                lambda: pp1_allocator.window == "actions" and not pp1_allocator.failed)
+            pp1_allocator.completion = completion
 
     def snapshot(event, **extra):
         cuda = torch.cuda
+        peak_allocated, peak_reserved = max(fill_peaks[0], cuda.max_memory_allocated()), max(
+            fill_peaks[1], cuda.max_memory_reserved())
         emit(event, allocated=cuda.memory_allocated(), reserved=cuda.memory_reserved(),
-             peak_allocated=cuda.max_memory_allocated(), peak_reserved=cuda.max_memory_reserved(), **extra)
+             peak_allocated=peak_allocated, peak_reserved=peak_reserved, **extra)
 
     def hip():
         nonlocal last_hip
@@ -2142,13 +3454,32 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
 
     @wraps(original_combined)
     def combined(*args, **kwargs):
-        nonlocal calls, active_call
+        nonlocal calls, active_call, backward_first, backward_last, fill_peaks, backward_peaks
         calls += 1
         progress = dict(call=calls, forward=kwargs["f_virtual_microbatch_id"],
                         backward=kwargs["b_virtual_microbatch_id"])
         snapshot("schedule_enter", **progress)
+        if post_lifecycle is not None and progress["backward"] is not None and backward_first is None:
+            cuda = torch.cuda
+            fill_peaks = cuda.max_memory_allocated(), cuda.max_memory_reserved()
+            backward_first = calls
+            # Reset only counters, not allocations. Preserve the old high-water marks for
+            # comparison to the retained run's unreset schedule snapshots.
+            cuda.reset_peak_memory_stats()
         active_call = progress
+        owns_drain = ownership is not None and drain.context() is not None
+        if pp1_allocator is not None or owns_drain:
+            # The pinned scheduler supplies one callable for both observers.
+            get_chunk_id = kwargs.get("get_model_chunk_id") or args[11]
+        if pp1_allocator is not None:
+            def get_resident():
+                return resident_weight_storages(kwargs.get("model") or args[3])
+
+            pp1_allocator.observe("enter", progress, get_chunk_id, get_resident)
         try:
+            if owns_drain:
+                progress["chunk"] = get_chunk_id(progress["backward"], forward=False)
+                ownership.record("call_begin")
             if pair is not None:
                 pair.begin()
                 if kwargs.get("post_forward") is not None and (
@@ -2178,8 +3509,21 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
             if readiness is not None:
                 readiness.finish()
             active_call = None
+        if ownership is not None and "chunk" in progress:
+            ownership.record("call_return", context=progress)
+        if post_lifecycle is not None:
+            if progress["backward"] is not None:
+                backward_last = calls
+                backward_peaks = torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+                progress["backward_phase_peak_allocated"], progress["backward_phase_peak_reserved"] = (
+                    backward_peaks)
+            if ((rank in PRESSURE_RANKS and calls == PRESSURE_CALL)
+                    or (progress["forward"] is None and progress["backward"] in (249, 253, 255))):
+                progress["post_combine_counts"] = post_lifecycle.counts()
         snapshot("schedule_exit", **progress)
-        if monotonic() - last_hip >= 5:
+        if pp1_allocator is not None:
+            pp1_allocator.observe("return", progress, get_chunk_id, get_resident)
+        if not post_combine and monotonic() - last_hip >= 5:
             hip()
         return result
 
@@ -2214,19 +3558,29 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
     @wraps(original_step)
     def step(forward, data, model, optimizer, scheduler, config, schedule, iteration=None):
         nonlocal updates
-        verify_compile_threads(inductor.compile_threads)
+        compiler = verify_compile_threads(inductor.compile_threads)
         args = training.get_args()
         verify_effective_head(args, config, head_chunk)
         verify_effective_replay(args, config, replay)
+        if post_combine and (any(
+            getattr(obj, POST_COMBINE_FIELD, False) is not True
+            or str(obj.pipeline_model_parallel_layout) != FULL_LAYOUT
+            or obj.linear_attention_freq != [1, 1, 1, 0] * 10 + [1, 0]
+            or obj.moe_layer_freq != [0] * 3 + [1] * 39
+            or set(obj.recompute_modules) != {"layernorm", "linear_attn", "qkv", "shared_experts"}
+            for obj in (args, config)
+        ) or getattr(args, "optimizer", None) != "md_decoupling"):
+            raise ValueError("unexpected effective full-layout post-combine settings")
         if layers == REDUCED_LAYERS:
             verify_reduced_model(args, config)
         geometry = {k: getattr(mpu, f"get_{k}_parallel_world_size")() for k in GEOMETRY}
         if (geometry != GEOMETRY or get_num_microbatches() != MICRO or iteration != 0 or updates
-                or (later_trace and mpu.get_pipeline_model_parallel_rank() != rank // 16)
+                or ((later_trace or post_combine) and mpu.get_pipeline_model_parallel_rank() != rank // 16)
                 or args.train_iters != 1 or args.global_batch_size != BATCH or args.micro_batch_size != MBS
                 or args.seq_length != SEQ or args.num_layers != layers or config.num_layers != layers
                 or args.consumed_train_samples != 0
-                or args.load is not None or args.save is not None or args.fp8 is not None
+                or args.load is not None or args.save != (str(checkpoint) if checkpoint else None)
+                or args.fp8 is not None
                 or not args.overlap_grad_reduce or not args.align_grad_reduce
                 or args.main_grads_dtype != torch.float32 or args.params_dtype != torch.bfloat16
                 or not isinstance(optimizer, LayerWiseDistributedOptimizer)
@@ -2239,7 +3593,7 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
             raise ValueError("unexpected one-update full-layout diagnostic recipe")
         snapshot("update_enter", pp_rank=mpu.get_pipeline_model_parallel_rank(),
                  inductor_compile_threads=inductor.compile_threads, geometry=geometry,
-                 num_layers=layers, lm_head_token_chunk_size=head_chunk, **{REPLAY_FIELD: replay})
+                 num_layers=layers, lm_head_token_chunk_size=head_chunk, **{REPLAY_FIELD: replay}, **compiler)
         hip()
         rerun = get_rerun_state_machine()
         before = rerun.rerun_count
@@ -2255,6 +3609,24 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
                     replacement = wrap(original)
                 originals.append((module, attr, original))
                 setattr(module, attr, replacement)
+
+            if post_lifecycle is not None:
+                from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+                from megatron.core.transformer.moe.moe_layer import MoELayer
+
+                hook(MoELayer, "postprocess", post_lifecycle.wrap_forward)
+                hook(CheckpointWithoutOutput, "_recompute",
+                     lambda fn: post_lifecycle.wrap_replay(fn, MoELayer._project_and_add_shared))
+                hook(MoELayer, "backward_dw", post_lifecycle.wrap_drain)
+                # Keep the post-schedule host boundaries, without tracing every node or
+                # recording GPU events, so a partial run can still locate finalization.
+                for owner, attr, name in (
+                    (config, "finalize_model_grads_func", "grad_finalize"),
+                    (LayerWiseDistributedOptimizer, "prepare_grad_norm", "grad_norm"),
+                    (LayerWiseDistributedOptimizer, "step_after_grad_norm", "optimizer_step"),
+                ):
+                    hook(owner, attr, lambda fn, name=name:
+                         trace_boundary(fn, name, snapshot, lambda: {}))
 
             if ck_seed is not None and ck_training_mapping_required(rank, reduced_drain):
                 backends = importlib.import_module(
@@ -2397,6 +3769,38 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
             if extended_timeout and later is not None and later.target is not None:
                 timeout_trace = ExtendedTimeoutTrace(torch.cuda, emit, later, stall)
                 hook(token_dispatcher, "fused_fp8_dispatch_fwd", timeout_trace.wrap)
+            if ownership is not None and ownership.detail:
+                from deep_ep import Buffer
+                from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
+                from megatron.core.pipeline_parallel import p2p_communication
+                from megatron.core.transformer.moe.resident_fp8 import ResidentFP8Experts, _NativeBackend
+
+                hook(TransformerLayerSchedulePlan, "run", ownership.wrap_layer)
+                hook(TransformerLayerSchedulePlan, "release_state", ownership.wrap_release)
+                hook(ResidentFP8Experts, "_backward", ownership.wrap_backward)
+                hook(ResidentFP8Experts, "drain", ownership.wrap_drain)
+                hook(_NativeBackend, "gemm", ownership.wrap_gemm)
+                for operation in ("dispatch", "combine"):
+                    hook(Buffer, operation, lambda fn, name=operation: ownership.wrap_exchange(fn, name))
+                hook(p2p_communication, "_p2p_ops", ownership.wrap_p2p)
+            if pp1_allocator is not None and pp1_lifetime_trace:
+                from deep_ep import Buffer
+
+                for operation in ("dispatch", "combine"):
+                    hook(Buffer, f"internode_{operation}", lambda fn, op=operation:
+                         pp1_allocator.wrap_ep(fn, op, lambda: active_call))
+            if completion is not None:
+                from deep_ep.utils import EventOverlap
+                from megatron.core.models.gpt.fine_grained_callables import TransformerLayerNode
+
+                for operation in ("dispatch", "combine"):
+                    hook(Buffer, f"internode_{operation}", lambda fn, op=operation:
+                         completion.wrap_exchange(fn, op))
+                hook(EventOverlap, "current_stream_wait", completion.wrap_wait)
+                hook(ScheduleNode, "_backward", lambda fn: completion.wrap_consumer(fn, "node"))
+                hook(TransformerLayerNode, "backward_dw", lambda fn: completion.wrap_consumer(fn, "wgrad"))
+                hook(sys.modules["fla.ops.kda.chunk"], "chunk_kda_bwd",
+                     lambda fn: wrap_pp1_kda_backward(fn, completion, pp1_kda_evidence))
             if drain is not None:
                 from megatron.core.models.gpt.fine_grained_callables import TransformerLayerNode
 
@@ -2408,12 +3812,16 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
                     (LayerWiseDistributedOptimizer, "step_after_grad_norm", "optimizer_step"),
                 ):
                     if not callable(getattr(owner, attr)):
-                        raise ValueError(f"missing reduced drain phase: {boundary}")
+                        raise ValueError(f"missing drain phase: {boundary}")
                     hook(owner, attr, lambda fn, name=boundary: drain.wrap_phase(fn, name))
             result = original_step(forward, data, model, optimizer, scheduler, config, schedule, iteration)
         finally:
             if pair is not None:
                 pair.stop.set()
+            if pp1_allocator is not None:
+                pp1_allocator.close()
+            if completion is not None:
+                completion.close()
             for module, attr, fn in reversed(originals):
                 setattr(module, attr, fn)
             schedules.combined_1f1b_schedule_for_interleaved_pipelining = original_combined
@@ -2425,6 +3833,10 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
                 or not all(math.isfinite(v) for v in losses.values())):
             raise ValueError("one-update diagnostic did not reach a qualified update")
         snapshot("update_exit", calls=calls, grad_norm=float(norm), losses=losses)
+        if post_lifecycle is not None:
+            emit("post_combine_backward_peak", first_call=backward_first, last_call=backward_last,
+                 allocated=backward_peaks[0], reserved=backward_peaks[1])
+            emit("post_combine_lifecycle", counts=post_lifecycle.counts())
         hip()
         updates += 1
         return result
@@ -2433,12 +3845,111 @@ def install(emit, head_chunk, replay, layers, notify_trace=False, dependency_tra
     return lambda: updates
 
 
+def kda_release_requested(frozen, ownership_trace):
+    """Allow only the A/B-qualified signed module in the matched full-depth run."""
+    aux = frozen["procedure"].get("auxiliary_source")
+    if aux is None:
+        return False
+    if aux != KDA_RELEASE or not ownership_trace or frozen["image"]["sha256"] != CK_IMAGE:
+        raise ValueError("unexpected KDA release inputs")
+    return True
+
+
+class KDAReleaseFinder(importlib.abc.MetaPathFinder):
+    """Resolve only the signed backward module; do not insert a package overlay."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == KDA_MODULE:
+            return importlib.util.spec_from_file_location(fullname, KDA_FROZEN_FILE)
+        return None
+
+
+def install_kda_release():
+    if any(name == "fla" or name.startswith("fla.") for name in sys.modules):
+        raise ValueError("FLA already imported before signed KDA module selection")
+    if (sha256(KDA_IMAGE_ROOT / KDA_RELEASE["path"]) != KDA_BASELINE_SHA
+            or sha256(KDA_FROZEN_FILE) != KDA_RELEASE["sha256"]
+            or any(importlib.metadata.version(p) != "0.5.2" for p in ("flash-linear-attention", "fla-core"))):
+        raise ValueError("unexpected KDA module or image package bytes")
+    finder = KDAReleaseFinder()
+    sys.meta_path.insert(0, finder)
+    return finder
+
+
+def verify_kda_release_imports():
+    """Reject unexpected FLA imports or a different function in the public KDA path."""
+    bwd, chunk = (sys.modules[name] for name in (KDA_MODULE, "fla.ops.kda.chunk"))
+    if (Path(bwd.__file__).resolve() != KDA_FROZEN_FILE or sha256(KDA_FROZEN_FILE) != KDA_RELEASE["sha256"]
+            or chunk.chunk_kda_bwd is not bwd.chunk_kda_bwd
+            or any(not Path(mod.__file__).resolve().is_relative_to(KDA_IMAGE_ROOT)
+                   for name, mod in list(sys.modules.items())
+                   if (name == "fla" or name.startswith("fla.")) and name != KDA_MODULE
+                   and getattr(mod, "__file__", None))):
+        raise ValueError("signed KDA backward import verification failed")
+    return {"commit": KDA_RELEASE["commit"], "sha256": KDA_RELEASE["sha256"]}
+
+
+def wrap_first_kda_release(original, emit, evidence, *, on_first=None):
+    """Log the first signed backward without replacing another observer's hook."""
+    seen = False
+
+    @wraps(original)
+    def first(*args, **kwargs):
+        nonlocal seen
+        if seen:
+            return original(*args, **kwargs)
+        seen = True
+        if on_first is not None:
+            on_first(first)
+        emit("kda_release_backward_enter", **evidence)
+        result = original(*args, **kwargs)
+        emit("kda_release_backward_return", **evidence)
+        return result
+
+    return first
+
+
+def observe_first_kda_release(emit, evidence):
+    """Use a self-removing observer when no scoped completion hook owns the slot."""
+    chunk = sys.modules["fla.ops.kda.chunk"]
+    original = chunk.chunk_kda_bwd
+
+    def restore(wrapper):
+        if chunk.chunk_kda_bwd is wrapper:
+            chunk.chunk_kda_bwd = original
+
+    chunk.chunk_kda_bwd = wrap_first_kda_release(original, emit, evidence, on_first=restore)
+
+
+def wrap_pp1_kda_backward(original, completion, evidence):
+    """Keep both observers in one step-scoped hook; only step cleanup restores the slot."""
+    if original is not sys.modules[KDA_MODULE].chunk_kda_bwd:
+        raise ValueError("PP1 comparison did not hook the signed KDA backward")
+    return completion.wrap_consumer(wrap_first_kda_release(original, completion.emit, evidence), "kda")
+
+
 def run_training(output, source, entrypoint, argv):
     """Persist progress incrementally, including the last entered schedule call."""
-    rejected = {"--load", "--save", "--pretrained-checkpoint", "--finetune", "--async-save", "--profile",
+    rejected = {"--load", "--pretrained-checkpoint", "--finetune", "--async-save", "--profile",
                 "--log-device-memory-used"}
     if int(os.environ["WORLD_SIZE"]) != WORLD or any(a.split("=", 1)[0] in rejected for a in argv):
         raise ValueError("diagnostic requires 64 ranks without checkpoint I/O or profiling")
+    post_combine = any(a.split("=", 1)[0] == POST_COMBINE_FLAG for a in argv)
+    checkpoint = None
+    if post_combine:
+        frozen = json.loads((output.parent / "resolved.json").read_text())
+        if frozen["procedure"].get("checkpoint") is True:
+            checkpoint = output / "checkpoints"
+            if checkpoint.exists() or checkpoint.is_symlink():
+                raise ValueError("checkpoint destination is not fresh")
+        expected_argv = frozen["args"] + (["--save", str(checkpoint)] if checkpoint else [])
+        if (expected_argv != argv or frozen["entrypoint"] != entrypoint
+                or not post_combine_profile(frozen)
+                or any(os.environ.get(k) != v for k, v in frozen["environment"].items())
+                or sha256(Path("/apertus/source/manifest.json")) != POST_COMBINE_MANIFEST):
+            raise ValueError("live and frozen full-layout replay inputs disagree")
+    elif any(a.split("=", 1)[0] == "--save" for a in argv):
+        raise ValueError("unexpected save in a no-checkpoint diagnostic")
     head_chunk = head_chunk_size(argv)
     replay = replay_requested(argv)
     reduced_drain = reduced_drain_requested(os.environ)
@@ -2447,15 +3958,37 @@ def run_training(output, source, entrypoint, argv):
     dependency_trace = dependency_trace_requested(os.environ, notify_trace)
     prefix_trace = prefix_trace_requested(os.environ, dependency_trace)
     pair_trace = pair_trace_requested(os.environ, prefix_trace)
-    ck_prewarm = ck_prewarm_requested(os.environ, pair_trace)
+    ck_prewarm = post_combine or ck_prewarm_requested(os.environ, pair_trace)
     later_trace = later_trace_requested(os.environ, ck_prewarm)
     later_phase = later_phase_requested(os.environ, later_trace)
     reverse_ready = reverse_ready_requested(os.environ, later_phase)
     stall_trace = stall_trace_requested(os.environ, reverse_ready)
     handoff_trace = handoff_trace_requested(os.environ, stall_trace)
-    extended_timeout = extended_timeout_requested(os.environ, handoff_trace)
-    if stall_trace and json.loads((output.parent / "resolved.json").read_text())["source"]["commit"] != STALL_SOURCE:
-        raise ValueError("stall trace requires the pinned signed readiness source")
+    extended_timeout = False if post_combine else extended_timeout_requested(os.environ, handoff_trace)
+    ownership_trace = ownership_trace_requested(os.environ, layers, head_chunk, replay, extended_timeout)
+    kda_release = post_combine
+    pp1_allocator_trace = False
+    pp1_lifetime_trace = False
+    pp1_completion_trace = False
+    if stall_trace:
+        frozen = json.loads((output.parent / "resolved.json").read_text())
+        if frozen["source"]["commit"] != STALL_SOURCE:
+            raise ValueError("stall trace requires the pinned signed readiness source")
+        if compile_threads(frozen["environment"]) != compile_threads(os.environ):
+            raise ValueError("live and frozen compiler profiles disagree")
+        if ownership_trace != ownership_trace_requested(frozen["environment"], layers, head_chunk, replay,
+                                                        extended_timeout):
+            raise ValueError("live and frozen ownership profiles disagree")
+        kda_release = kda_release_requested(frozen, ownership_trace)
+        pp1_allocator_trace = pp1_allocator_requested(frozen.get("environment", {}), ownership_trace, kda_release)
+        pp1_lifetime_trace = pp1_lifetime_requested(frozen.get("environment", {}), pp1_allocator_trace)
+        pp1_completion_trace = pp1_completion_requested(frozen.get("environment", {}), pp1_lifetime_trace)
+    if pp1_allocator_trace != pp1_allocator_requested(os.environ, ownership_trace, kda_release):
+        raise ValueError("live and frozen PP1 allocator profiles disagree")
+    if pp1_lifetime_trace != pp1_lifetime_requested(os.environ, pp1_allocator_trace):
+        raise ValueError("live and frozen PP1 lifetime profiles disagree")
+    if pp1_completion_trace != pp1_completion_requested(os.environ, pp1_lifetime_trace):
+        raise ValueError("live and frozen PP1 completion profiles disagree")
     rank = int(os.environ["RANK"])
     with (output / f"gpu-progress-rank-{rank}.jsonl").open("x") as stream:
         emit_lock = Lock()
@@ -2467,27 +4000,60 @@ def run_training(output, source, entrypoint, argv):
                                      separators=(",", ":")), file=stream, flush=True)
 
         observer = {}
+        finder = None
         emit("entry")
         ck_seed = None
         try:
             if ck_prewarm:
                 ck_seed = prewarm_ck(output, rank, emit)
-            train(output, source, entrypoint, argv,
-                  before_run=lambda: observer.update(
-                      count=install(emit, head_chunk, replay, layers, notify_trace, dependency_trace,
-                                    prefix_trace, pair_trace, ck_seed, later_trace, later_phase, reverse_ready,
-                                    stall_trace, handoff_trace, extended_timeout, reduced_drain)))
+            if kda_release:
+                finder = install_kda_release()
+
+            def before_run():
+                evidence = None
+                if kda_release:
+                    # The selected function is the same entry used by the qualified isolated A/B.
+                    importlib.import_module("fla.ops.kda.chunk")
+                    evidence = verify_kda_release_imports()
+                scoped_kda = pp1_completion_trace and rank in PP1AllocatorTrace.RANKS
+                observer["count"] = install(
+                    emit, head_chunk, replay, layers, notify_trace, dependency_trace,
+                    prefix_trace, pair_trace, ck_seed, later_trace, later_phase, reverse_ready,
+                    stall_trace, handoff_trace, extended_timeout, reduced_drain, ownership_trace,
+                    pp1_allocator_trace, pp1_lifetime_trace, pp1_completion_trace,
+                    pp1_kda_evidence=evidence if scoped_kda else None,
+                    post_combine=post_combine,
+                    checkpoint=checkpoint,
+                )
+                if checkpoint:
+                    from megatron.training import checkpointing, training
+
+                    observer["saved"] = observe_sync_save(
+                        training, checkpointing, checkpoint, emit, observer["count"])
+                if kda_release:
+                    emit("kda_release_verified", **evidence)
+                    if not scoped_kda:
+                        observe_first_kda_release(emit, evidence)
+
+            train(output, source, entrypoint, argv, before_run=before_run)
             import torch
 
             if observer["count"]() != 1:
                 raise ValueError("expected exactly one observed update")
+            if checkpoint and not observer["saved"]():
+                raise ValueError("expected exactly one completed synchronous save")
             torch.cuda.synchronize()
             if ck_seed is not None and ck_training_mapping_required(rank, reduced_drain):
                 verify_ck_training(ck_seed)
+            if kda_release:
+                emit("kda_release_reverified", **verify_kda_release_imports())
             torch.distributed.destroy_process_group()
         except BaseException as exc:
             emit("error", error=f"{type(exc).__name__}: {exc}")
             raise
+        finally:
+            if finder is not None:
+                sys.meta_path.remove(finder)
         emit("completed")
 
 
@@ -2497,6 +4063,9 @@ def check(run):
     result = dict(status="failed", scope="one cold full-layout update; no checkpoint, cache or throughput verdict")
     try:
         frozen = json.loads((run / "resolved.json").read_text())
+        post_combine = post_combine_profile(frozen)
+        sync_save = post_combine and frozen["procedure"].get("checkpoint") is True
+        expected_threads = compile_threads(frozen.get("environment", {}))
         mapped = set(frozen["procedure"]["memory_mapping_ranks"])
         chunk = head_chunk_size(frozen["args"])
         replay = replay_requested(frozen["args"])
@@ -2507,13 +4076,23 @@ def check(run):
         dependency_trace = dependency_trace_requested(frozen.get("environment", {}), notify_trace)
         prefix_trace = prefix_trace_requested(frozen.get("environment", {}), dependency_trace)
         pair_trace = pair_trace_requested(frozen.get("environment", {}), prefix_trace)
-        ck_prewarm = ck_prewarm_requested(frozen.get("environment", {}), pair_trace)
+        ck_prewarm = post_combine or ck_prewarm_requested(frozen.get("environment", {}), pair_trace)
         later_trace = later_trace_requested(frozen.get("environment", {}), ck_prewarm)
         later_phase = later_phase_requested(frozen.get("environment", {}), later_trace)
         reverse_ready = reverse_ready_requested(frozen.get("environment", {}), later_phase)
         stall_trace = stall_trace_requested(frozen.get("environment", {}), reverse_ready)
         handoff_trace = handoff_trace_requested(frozen.get("environment", {}), stall_trace)
-        extended_timeout = extended_timeout_requested(frozen.get("environment", {}), handoff_trace)
+        extended_timeout = not post_combine and extended_timeout_requested(frozen.get("environment", {}), handoff_trace)
+        ownership_trace = ownership_trace_requested(frozen.get("environment", {}), layers, chunk, replay,
+                                                   extended_timeout)
+        kda_release = post_combine or kda_release_requested(frozen, ownership_trace)
+        pp1_allocator_trace = pp1_allocator_requested(frozen.get("environment", {}), ownership_trace, kda_release)
+        pp1_lifetime_trace = pp1_lifetime_requested(frozen.get("environment", {}), pp1_allocator_trace)
+        pp1_completion_trace = pp1_completion_requested(frozen.get("environment", {}), pp1_lifetime_trace)
+        if kda_release and sha256(run / "auxiliary.py") != KDA_RELEASE["sha256"]:
+            raise ValueError("retained KDA module bytes changed")
+        if ownership_trace and frozen["procedure"].get("scratch_telemetry") is not True:
+            raise ValueError("ownership trace lacks supervisor scratch telemetry")
         if stall_trace and frozen["source"]["commit"] != STALL_SOURCE:
             raise ValueError("stall trace requires the pinned signed readiness source")
         if ck_prewarm:
@@ -2534,18 +4113,37 @@ def check(run):
             scope = ("one 24-layer drain control with node-verified CK prewarm; not full Chonk"
                      if reduced_drain else "one cold 24-layer reduced-model update; not full Chonk")
             result.update(scope=scope, num_layers=layers, lm_head="chunked" if chunk else "dense", fc1_replay=replay)
+        if expected_threads == 1:
+            result.update(inductor_compile_threads=1, serial_build_environment=SERIAL_BUILD_ENV)
         observed_mappings = []
+        backward_peaks = {}
+        save_times = []
         for r in range(WORLD):
             gpu = [json.loads(line) for line in (output / f"gpu-progress-rank-{r}.jsonl").read_text().splitlines()]
+            if post_combine:
+                backward_peaks[r] = verify_post_combine_trace(gpu, r)
+            if sync_save:
+                save_times.append(verify_sync_save_trace(gpu, r))
+            if kda_release:
+                expected = (KDA_RELEASE["commit"], KDA_RELEASE["sha256"])
+                names = ("kda_release_verified", "kda_release_backward_enter",
+                         "kda_release_backward_return", "kda_release_reverified")
+                evidence = [(d["event"], d.get("commit"), d.get("sha256")) for d in gpu
+                            if d["event"] in names]
+                if evidence != [(name, *expected) for name in names]:
+                    raise ValueError(f"rank {r} missing signed KDA module evidence")
             host = [json.loads(line) for line in (output / f"host-memory-rank-{r}.jsonl").read_text().splitlines()]
             imports = json.loads((output / f"imports-{r}.json").read_text())
+            compiler_rows = [row for row in gpu if row["event"] in ("compiler_config", "update_enter")]
             if (not gpu or gpu[0]["event"] != "entry" or gpu[-1]["event"] != "completed"
                     or any(row["rank"] != r for row in gpu)
                     or sum(row["event"] == "update_exit" for row in gpu) != 1
-                    or [row["inductor_compile_threads"] for row in gpu
-                        if row["event"] in ("compiler_config", "update_enter")] != [COMPILE_THREADS] * 2
+                    or [row["inductor_compile_threads"] for row in compiler_rows] != [expected_threads] * 2
                     or not host or host[-1]["event"] != "exit:0" or not imports["verified_modules"]):
                 raise ValueError(f"rank {r} missing completed diagnostic evidence")
+            if expected_threads == 1 and [row.get("serial_build_environment") for row in compiler_rows] != [
+                    SERIAL_BUILD_ENV] * 2:
+                raise ValueError(f"rank {r} missing serial build environment evidence")
             if chunk and [row.get("lm_head_token_chunk_size") for row in gpu
                           if row["event"] == "update_enter"] != [chunk]:
                 raise ValueError(f"rank {r} missing effective LM-head chunk size {chunk}")
@@ -2584,8 +4182,16 @@ def check(run):
                 verify_sender_phases(gpu, r, CALL8_SENDER, live_nodes=True)
             if extended_timeout and r >= 32:
                 verify_extended_timeout_trace(gpu, r)
-            if reduced_drain:
+            if reduced_drain or ownership_trace:
                 verify_backward_drain(gpu, r)
+            if ownership_trace:
+                verify_ownership(gpu, r)
+                if not any(row.get("scratch_inventory") for row in host):
+                    raise ValueError(f"rank {r} missing scratch metadata evidence")
+            if pp1_allocator_trace:
+                verify_pp1_allocator(gpu, r, pp1_lifetime_trace)
+            if pp1_completion_trace:
+                verify_pp1_completion(gpu, r)
             if r in TRACE_RANKS:
                 if notify_trace:
                     verify_notify_trace(gpu, r)
@@ -2605,7 +4211,14 @@ def check(run):
                 raise ValueError(f"rank {r} missing native CXI initialization")
             if ck_prewarm:
                 verify_ck_rank(gpu, log, r, handoffs[r // 4], ck_training_mapping_required(r, reduced_drain))
-        if (output / "checkpoints").exists():
+        if sync_save:
+            result.update(
+                scope="one full-layout update and synchronous torch_dist save; no restart or throughput verdict",
+                checkpoint=checkpoint_inventory(output / "checkpoints"),
+                checkpoint_seconds={"min": min(save_times), "max": max(save_times)},
+                checkpoint_verified_ranks=list(range(WORLD)),
+            )
+        elif (output / "checkpoints").exists():
             raise ValueError("unexpected checkpoint directory")
         result.update(status="passed", ranks=WORLD, updates=1, observed_mapping_ranks=observed_mappings)
         if chunk:
@@ -2639,8 +4252,22 @@ def check(run):
             result.update(autograd_handoff_ranks=list(PRESSURE_RANKS), call8_sender_phase_ranks=list(PAIR_SENDERS))
         if extended_timeout:
             result.update(uccl_cpu_timeout_seconds=600, dispatch_sample_ranks=list(range(32, WORLD)))
-        if reduced_drain:
+        if reduced_drain or ownership_trace:
             result.update(backward_drain_verified_ranks=list(range(WORLD)))
+        if ownership_trace:
+            result.update(ownership_boundary_verified_ranks=list(range(WORLD)),
+                          ownership_detail_ranks=list(DrainOwnership.DETAIL_RANKS), driver_scratch="not instrumented")
+        if kda_release:
+            result.update(kda_release_commit=KDA_RELEASE["commit"], kda_release_verified_ranks=list(range(WORLD)))
+        if pp1_allocator_trace:
+            result.update(pp1_allocator_ranks=list(PP1AllocatorTrace.RANKS))
+        if pp1_lifetime_trace:
+            result.update(pp1_lifetime_ranks=list(PP1AllocatorTrace.RANKS))
+        if pp1_completion_trace:
+            result.update(pp1_completion_ranks=list(PP1AllocatorTrace.RANKS))
+        if post_combine:
+            result.update(post_combine_verified_ranks=list(range(WORLD)),
+                          schedule_backward_phase_peaks=backward_peaks)
     except Exception as exc:
         result["error"] = str(exc)
         raise
@@ -2653,8 +4280,13 @@ if __name__ == "__main__":
         run_training(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5:])
     elif sys.argv[1:2] == ["check"] and len(sys.argv) == 3:
         check(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ["compare-post-combine"] and len(sys.argv) == 5:
+        report = compare_post_combine_memory(Path(sys.argv[2]), Path(sys.argv[3]))
+        with Path(sys.argv[4]).open("x") as stream:
+            json.dump(report, stream, indent=2)
+            stream.write("\n")
     elif (sys.argv[1:2] == ["ck-prewarm-worker"] and len(sys.argv) == 3
           and os.environ.get(CK_PREWARM) == CK_NODE_VERIFIED):
         ck_prewarm_worker(Path(sys.argv[2]))
     else:
-        raise SystemExit("expected train, check, or an enabled CK prewarm worker")
+        raise SystemExit("expected train, check, compare-post-combine, or an enabled CK prewarm worker")

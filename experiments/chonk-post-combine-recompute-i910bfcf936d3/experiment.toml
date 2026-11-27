@@ -1,0 +1,29 @@
+# Local post-combine component only; no DeepEP collective or training update.
+nodes = 1
+entrypoint = "megatron/core/transformer/moe/moe_layer.py"
+args = []
+
+[source]
+repository = "git@github.com:boeschf/Megatron-LM-MoE.git"
+commit = "041c1d753028e4190efb342accb98a6f362ee7dd"
+excluded_submodules = ["_research"]
+
+[image]
+store = "apertus-amd-images"
+sha256 = "910bfcf936d3f7a1dfd17dc560481cfeff6c5d9a7f5619c14f43b17348a28490"
+
+[environment]
+PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+OMP_NUM_THREADS = "18"
+MAX_JOBS = "1"
+TORCHINDUCTOR_COMPILE_THREADS = "1"
+CMAKE_BUILD_PARALLEL_LEVEL = "1"
+MAKEFLAGS = "-j1"
+
+[procedure]
+kind = "probe"
+timeout = 1500
+gpu_identity_timeout = 600
+startup_trace = true
+validation = "../validation/post_combine_recompute.py"
+launch_blocked = "One-shot post-combine projection/add component A/B submitted as job 766673; no further launch is authorized."

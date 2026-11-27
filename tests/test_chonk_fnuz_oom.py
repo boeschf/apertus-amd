@@ -139,6 +139,181 @@ def test_reduced_recipe_rejects_other_depths_and_memory_changes():
             depth(argv, chunk, replay)
 
 
+def test_serial_compile_plan_only_changes_build_concurrency(tmp_path):
+    full = plan(ROOT / "experiments/chonk-native-fnuz-timeout600-i910bfcf936d3",
+                **FULL_PROBE_OPTIONS, cache_image=True, reservation="cscs")
+    serial = plan(ROOT / "experiments/chonk-native-fnuz-compile1-i910bfcf936d3",
+                  **FULL_PROBE_OPTIONS, cache_image=True, reservation="cscs")
+    assert {k for k in serial if serial[k] != full[k]} == {
+        "experiment", "environment", "runtime_environment", "procedure"
+    }
+    changes = {"TORCHINDUCTOR_COMPILE_THREADS": "1", "MAX_JOBS": "1",
+               "CMAKE_BUILD_PARALLEL_LEVEL": "1", "MAKEFLAGS": "-j1"}
+    assert serial["environment"] == {**full["environment"], **changes}
+    assert serial["runtime_environment"] == {**full["runtime_environment"], "MAX_JOBS": "1"}
+    assert serial["procedure"] == {**full["procedure"], "launch_blocked": serial["procedure"]["launch_blocked"]}
+    assert all(f'{key} = "{value}"' in runs.edf(serial, tmp_path) for key, value in changes.items())
+    with pytest.raises(ValueError, match="launch blocked"):
+        runs.run(serial)
+
+
+def test_full_ownership_plan_preserves_serial_compile_inputs():
+    kwargs = {**FULL_PROBE_OPTIONS, "cache_image": True, "reservation": "cscs"}
+    serial = plan(ROOT / "experiments/chonk-native-fnuz-compile1-i910bfcf936d3", **kwargs)
+    trace = plan(ROOT / "experiments/chonk-native-fnuz-ownership-i910bfcf936d3", **kwargs)
+    assert {key for key in trace if trace[key] != serial[key]} == {"experiment", "environment", "procedure"}
+    assert trace["environment"] == {**serial["environment"], "APERTUS_CHONK_OWNERSHIP_TRACE": "1"}
+    assert trace["procedure"] == {**serial["procedure"], "launch_blocked": trace["procedure"]["launch_blocked"],
+                                 "scratch_telemetry": True}
+    select = OBSERVER["ownership_trace_requested"]
+    assert select(trace["environment"], 42, 512, True, True)
+    for inputs in ((24, 512, True, True), (42, 0, True, True), (42, 512, False, True), (42, 512, True, False)):
+        with pytest.raises(ValueError, match="full-depth serial-build recipe"):
+            select(trace["environment"], *inputs)
+    with pytest.raises(ValueError, match="launch blocked"):
+        runs.run(trace)
+
+
+def test_kda_release_plan_preserves_full_ownership_inputs(tmp_path):
+    kwargs = {**FULL_PROBE_OPTIONS, "cache_image": True, "reservation": "cscs"}
+    old = plan(ROOT / "experiments/chonk-native-fnuz-ownership-i910bfcf936d3", **kwargs)
+    new = plan(ROOT / "experiments/chonk-native-fnuz-kda-release-i910bfcf936d3", **kwargs)
+    aux = OBSERVER["KDA_RELEASE"]
+    assert {key for key in new if new[key] != old[key]} == {"experiment", "procedure"}
+    assert new["procedure"] == {**old["procedure"], "launch_blocked": new["procedure"]["launch_blocked"],
+                                "auxiliary_source": aux}
+    assert f"{tmp_path}/auxiliary.py:/apertus/auxiliary.py:ro" in runs.edf(new, tmp_path)
+    assert "/apertus/auxiliary.py" not in runs.edf(old, tmp_path)
+    admit = OBSERVER["kda_release_requested"]
+    assert admit(new, True)
+    assert not admit(old, True)
+    with pytest.raises(ValueError, match="unexpected KDA release"):
+        admit(new, False)
+    with pytest.raises(ValueError, match="launch blocked"):
+        runs.run(new)
+
+
+def test_kda_release_finder_and_first_backward_are_exact(monkeypatch):
+    finder = OBSERVER["KDAReleaseFinder"]()
+    assert finder.find_spec("fla.ops.kda.chunk") is None
+    assert finder.find_spec("fla.ops.kda.chunk_bwd").origin == "/apertus/auxiliary.py"
+    chunk = SimpleNamespace()
+    calls = []
+
+    def original(value):
+        assert chunk.chunk_kda_bwd is original
+        calls.append(value)
+        return value
+
+    chunk.chunk_kda_bwd = original
+    monkeypatch.setitem(sys.modules, "fla.ops.kda.chunk", chunk)
+    rows = []
+    observe = OBSERVER["observe_first_kda_release"]
+    observe(lambda event, **data: rows.append((event, data)), {"commit": "test"})
+    assert chunk.chunk_kda_bwd("first") == "first"
+    assert chunk.chunk_kda_bwd("second") == "second"
+    assert calls == ["first", "second"]
+    assert rows == [("kda_release_backward_enter", {"commit": "test"}),
+                    ("kda_release_backward_return", {"commit": "test"})]
+
+
+def test_ownership_records_deduplicate_views_without_retaining_tensors():
+    import weakref
+
+    class Tensor:
+        device = "cuda:0"
+        dtype = "torch.bfloat16"
+
+        def __init__(self, storage, offset):
+            self.storage, self.offset = storage, offset
+
+        def untyped_storage(self):
+            return self.storage
+
+        def storage_offset(self):
+            return self.offset
+
+    cuda = SimpleNamespace(current_stream=lambda: SimpleNamespace(cuda_stream=19),
+                           memory_stats=lambda: {"num_alloc_retries": 2, "num_ooms": 0})
+    rows = []
+    emit = lambda event, **values: rows.append({"event": event, **values})
+    scope = {"call": 258, "forward": None, "backward": 248}
+    drain = OBSERVER["BackwardDrainTrace"](emit, lambda: scope)
+    observer = OBSERVER["DrainOwnership"](SimpleNamespace(Tensor=Tensor, cuda=cuda), emit, drain, 10)
+    base = SimpleNamespace(_cdata=7, data_ptr=lambda: 100, nbytes=lambda: 64)
+    x, view = Tensor(base, 0), Tensor(base, 2)
+    refs = weakref.ref(x), weakref.ref(view)
+    hook = observer.wrap_p2p(lambda **kwargs: {"recv_next": "the original work"})
+    assert hook(tensor_send_prev=x, tensor_recv_next=view) == {"recv_next": "the original work"}
+    assert not rows
+    scope.update(call=259, backward=249, chunk=1)
+    observer.record("call_begin")
+    assert hook(tensor_send_prev=x, tensor_recv_next=view) == {"recv_next": "the original work"}
+    observer.record("call_return", context=scope)
+    del x, view
+    assert all(ref() is None for ref in refs)
+    s = rows[1]["storage"]
+    assert s["sampled_storage_bytes"] == 64
+    assert s["roles"] == {"tensor_send_prev": {"storages": 1, "bytes": 64},
+                          "tensor_recv_next": {"storages": 1, "bytes": 64}}
+    assert s["examples"]["tensor_recv_next"][0]["offset"] == 2
+    assert rows[0]["allocator"]["num_alloc_retries"] == 2
+    assert rows[0]["allocator"]["active_bytes.all.current"] is None
+    json.dumps(rows)
+    rows.append({"event": "schedule_exit", **scope})
+    OBSERVER["verify_ownership"](rows, 10)
+    with pytest.raises(ValueError, match="call_return"):
+        OBSERVER["verify_ownership"]([r for r in rows if r.get("boundary") != "call_return"], 10)
+
+
+def test_scratch_inventory_accounts_deleted_and_deduplicates_hard_links(tmp_path):
+    root = tmp_path / "scratch"
+    root.mkdir()
+    cache = root / "cache-10"
+    cache.mkdir()
+    p = cache / "object"
+    p.write_bytes(b"x" * 4096)
+    (cache / "alias").hardlink_to(p)
+    (root / "no-follow").symlink_to(tmp_path)
+    dump = root / "core_123.gpu"
+    dump.write_bytes(b"x" * 4096)
+    live = dump.stat().st_blocks * 512
+    with dump.open("rb") as descriptor:
+        dump.unlink()
+        # Use the real Linux descriptor scan to preserve its kernel deletion marker.
+        row = memory_telemetry.scratch_inventory(root, [os.getpid()], include_tree=True)
+        assert row["bytes_by_tag"] == {"rank_cache": p.stat().st_blocks * 512, "dump_like:deleted": live}
+        assert any(x["path"] == dump.name and x["deleted"] for x in row["largest"])
+        assert not descriptor.closed
+    bounded = memory_telemetry.scratch_inventory(root, [], include_tree=True, limit=1)
+    assert bounded["truncated"] and bounded["status"] == "partial"
+
+
+def test_ownership_budget_keeps_call_endpoints_and_original_exception():
+    rows = []
+    emit = lambda event, **values: rows.append({"event": event, **values})
+    scope = {"call": 261, "forward": None, "backward": 255, "chunk": 0}
+    drain = OBSERVER["BackwardDrainTrace"](emit, lambda: scope)
+    cuda = SimpleNamespace(current_stream=lambda: SimpleNamespace(cuda_stream=0), memory_stats=dict)
+    observer = OBSERVER["DrainOwnership"](SimpleNamespace(Tensor=object, cuda=cuda), emit, drain, 16)
+    observer.MAX_EVENTS = 2
+    observer.record("call_begin")
+    observer.record("detail_first")
+    observer.record("detail_limited")
+    observer.record("call_return", context=scope)
+    assert [r.get("boundary") for r in rows] == ["call_begin", "detail_first", None, "call_return"]
+    assert rows[2]["event"] == "ownership_limit"
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("original")
+
+    observe = observer.wrap_layer(failed)
+    layer = SimpleNamespace(layer=SimpleNamespace(layer_number=12))
+    with pytest.raises(RuntimeError, match="original"):
+        observe(None, layer)
+    assert observer.layer is None
+
+
 def test_reduced_drain_control_retains_full_recipe_except_depth_and_trace():
     full = plan(ROOT / "experiments/chonk-native-fnuz-timeout600-i910bfcf936d3",
                 **FULL_PROBE_OPTIONS, cache_image=True, reservation="cscs")
@@ -423,6 +598,23 @@ def test_effective_compile_limit_is_required(monkeypatch, requested, effective):
     else:
         with pytest.raises(ValueError, match="expected 4 Inductor compile threads"):
             OBSERVER["verify_compile_threads"](effective)
+
+
+@pytest.mark.parametrize("missing", [None, "MAX_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL", "MAKEFLAGS"])
+def test_serial_compile_profile_checks_all_controls(monkeypatch, missing):
+    serial = OBSERVER["SERIAL_BUILD_ENV"]
+    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
+    for key, value in serial.items():
+        monkeypatch.setenv(key, value)
+    verify = OBSERVER["verify_compile_threads"]
+    if missing is not None:
+        monkeypatch.delenv(missing)
+        with pytest.raises(ValueError, match="full serial build environment"):
+            verify(1)
+    else:
+        assert verify(1) == {"serial_build_environment": serial}
+        with pytest.raises(ValueError, match="expected 1 Inductor compile threads"):
+            verify(4)
 
 
 @pytest.mark.parametrize("rank_list", ["[48, 48]", "[-1]", "[64]", "[true]", "[]"])

@@ -161,7 +161,8 @@ def stop_child(process: subprocess.Popen) -> None:
 
 
 def child(command: list[str], log: Path, *, cwd: Path, env: dict, timeout: float | None = None,
-          session: Path | None = None, telemetry: Path | None = None, telemetry_mappings: bool = False) -> None:
+          session: Path | None = None, telemetry: Path | None = None, telemetry_mappings: bool = False,
+          telemetry_scratch: Path | None = None) -> None:
     """Monitor a bounded child and peer failures; stop its group before returning."""
     observation = telemetry.open("x") if telemetry is not None else nullcontext()
     with observation as samples, log.open("w") as stream:
@@ -170,15 +171,20 @@ def child(command: list[str], log: Path, *, cwd: Path, env: dict, timeout: float
         deadline = time.monotonic() + timeout if timeout is not None else None
         next_sample = 0.0
         next_mapping = 0.0
+        next_scratch = 0.0
 
         def record(event):
-            nonlocal next_mapping
+            nonlocal next_mapping, next_scratch
             if samples is not None:
-                mappings = telemetry_mappings and event == "live" and time.monotonic() >= next_mapping
+                now = time.monotonic()
+                mappings = telemetry_mappings and event == "live" and now >= next_mapping
+                scratch = telemetry_scratch if event != "live" or now >= next_scratch else None
                 memory_telemetry.sample(samples, process.pid, node_lead=env["LOCAL_RANK"] == "0", event=event,
-                                        mappings=mappings)
+                                        mappings=mappings, **({"scratch": scratch} if scratch is not None else {}))
                 if mappings:
                     next_mapping = time.monotonic() + 10.0
+                if scratch is not None:
+                    next_scratch = time.monotonic() + 15.0
 
         try:
             while True:
@@ -689,8 +695,9 @@ def main() -> None:
             require_affinity(initial_affinity, "probe child" if probe else "training child")
             child(command, directory / f"rank-{rank}.log", cwd=source, env=phase_env,
                   timeout=settings["procedure"]["timeout"] if probe else None, session=session,
-                  **({"telemetry": directory / f"host-memory-rank-{rank}.jsonl",
-                      "telemetry_mappings": rank in settings["procedure"].get("memory_mapping_ranks", [])}
+                   **({"telemetry": directory / f"host-memory-rank-{rank}.jsonl",
+                       "telemetry_mappings": rank in settings["procedure"].get("memory_mapping_ranks", []),
+                       "telemetry_scratch": scratch if settings["procedure"].get("scratch_telemetry") else None}
                      if settings["procedure"].get("memory_telemetry") else {}))
             exchange(session, name + "-exited", rank, world, {"exited": True}, timeout)
             if probe:

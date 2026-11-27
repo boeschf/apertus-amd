@@ -60,6 +60,8 @@ def edf(value: dict, directory: Path) -> str:
             values["mounts"].append(f"{value['data_root']}/cache:/apertus/cache")
     if value["validation"]:
         values["mounts"].append(f"{directory}/validation.py:/apertus/validation.py:ro")
+    if "auxiliary_source" in value["procedure"]:
+        values["mounts"].append(f"{directory}/auxiliary.py:/apertus/auxiliary.py:ro")
     # GL display discovery can block in XOpenDisplay during OFI topology loading.
     env = {**value["environment"], "HWLOC_COMPONENTS": "-gl", "PYTHONPATH": "/apertus/tooling",
            "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"}
@@ -200,6 +202,9 @@ def run(value: dict, checkout: Path | None = None) -> Path:
             snapshot = {k: source[k] for k in ("directory", "sha256", "tree")}
             snapshot["manifest_sha256"] = sha256(Path(source["directory"]) / "manifest.json")
             value = {**value, "source_snapshot": snapshot}
+        if "auxiliary_source" in value["procedure"]:
+            sources.freeze_auxiliary_file(value["procedure"]["auxiliary_source"], root / "sources",
+                                          directory / "auxiliary.py")
         package = Path(__file__).resolve().parent
         shutil.copytree(package, directory / "tooling/apertus_amd", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         if value["validation"]:

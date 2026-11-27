@@ -1,6 +1,7 @@
 """Prepare retained archives from exact Git commits, never live working files."""
 
 from contextlib import contextmanager
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import shutil
@@ -25,6 +26,29 @@ def extract(archive: Path, destination: Path) -> None:
     """Extract a source archive with Python's containment-aware data filter."""
     with tarfile.open(archive) as stream:
         stream.extractall(destination, filter="data")
+
+
+def freeze_auxiliary_file(selection: dict, root: Path, destination: Path) -> None:
+    """Copy exactly one reviewed regular member from an already retained source archive."""
+    parent = root / selection["commit"]
+    manifest = parent / "manifest.json"
+    archive = parent / "source.tar"
+    if sha256(manifest) != selection["manifest_sha256"]:
+        raise ValueError("auxiliary source manifest mismatch")
+    record = json.loads(manifest.read_text())
+    name, expected = selection["path"], selection["sha256"]
+    if (record["selection"]["commit"] != selection["commit"] or record["files"].get(name) != expected
+            or sha256(archive) != record["sha256"]):
+        raise ValueError("auxiliary source archive identity mismatch")
+    with tarfile.open(archive) as stream:
+        matches = [m for m in stream if m.name == name]
+        if len(matches) != 1 or not matches[0].isreg() or not 0 < matches[0].size <= 2**20:
+            raise ValueError("auxiliary source is not one bounded regular file")
+        data = stream.extractfile(matches[0]).read()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError("auxiliary source member checksum mismatch")
+    with destination.open("xb") as target:
+        target.write(data)
 
 
 def prepare(selection: dict, root: Path, *, local: Path) -> dict:

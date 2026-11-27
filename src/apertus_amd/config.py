@@ -88,6 +88,19 @@ def resolve(experiment: Path, *, site: Path = Path("config.toml"), **overrides) 
         procedure["kind"] != "probe" or procedure["memory_telemetry"] is not True
     ):
         raise ValueError("memory_telemetry=true is supported only for bounded probes")
+    if "scratch_telemetry" in procedure and (
+        procedure.get("memory_telemetry") is not True or procedure["scratch_telemetry"] is not True
+    ):
+        raise ValueError("scratch_telemetry=true requires probe memory telemetry")
+    if "auxiliary_source" in procedure:
+        aux = procedure["auxiliary_source"]
+        if (procedure["kind"] != "probe" or validation is None or not isinstance(aux, dict)
+                or set(aux) != {"commit", "manifest_sha256", "path", "sha256"}
+                or any(not isinstance(v, str) for v in aux.values())
+                or not re.fullmatch(r"[0-9a-f]{40}", aux["commit"])
+                or any(not re.fullmatch(r"[0-9a-f]{64}", aux[k]) for k in ("manifest_sha256", "sha256"))
+                or not re.fullmatch(r"(?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]+\.py", aux["path"])):
+            raise ValueError("auxiliary_source requires a validated probe and a pinned Python archive member")
     if "startup_only" in procedure and (
         procedure["kind"] != "probe" or procedure["startup_only"] is not True
         or "checkpoint" in procedure or "memory_telemetry" in procedure
